@@ -931,6 +931,7 @@ pub async fn run_tui(
     plugin_registry: std::sync::Arc<codewhale_plugins::PluginRegistry>,
     pending_telemetry_notice: Option<codewhale_engine::telemetry_notice::PendingTelemetryNotice>,
     launch_conversation_mode: Option<String>,
+    permission_mode: Option<codewhale_engine::runtime_options::PermissionMode>,
 ) -> Result<()> {
     // Install notification, sound, category, and attention policy before any
     // producer (including the model-facing notify tool) can emit an event.
@@ -1107,6 +1108,7 @@ pub async fn run_tui(
     let config = &mut config;
     let mut app = App::new_with_plugin_registry(options.clone(), config, plugin_registry);
     app.install_conversation_mode(launch_conversation_mode, None);
+    app.apply_cli_permission_mode(permission_mode);
     let _cursor_accent_guard = codewhale_tui_kit::cursor_accent::CursorAccentGuard::install(
         app.low_motion || !app.fancy_animations,
         app.ui_theme.accent_primary,

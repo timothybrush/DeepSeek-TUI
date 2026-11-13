@@ -2532,6 +2532,8 @@ impl BaseUrlEnvReceipt {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct AutoReviewConfig {
     #[serde(default)]
+    pub disabled: bool,
+    #[serde(default)]
     pub allow: Vec<AutoReviewRuleConfig>,
     #[serde(default)]
     pub block: Vec<AutoReviewRuleConfig>,
@@ -4294,6 +4296,17 @@ impl Config {
         }
         if let Some(auto_review) = &self.auto_review {
             auto_review.validate()?;
+            if auto_review.disabled
+                && self
+                    .approval_policy
+                    .as_deref()
+                    .and_then(codewhale_execpolicy::ApprovalMode::from_config_value)
+                    == Some(codewhale_execpolicy::ApprovalMode::Auto)
+            {
+                anyhow::bail!(
+                    "approval_policy = \"auto\" is disabled by managed configuration (`auto_review.disabled = true`)"
+                );
+            }
         }
         if let Some(providers) = &self.providers {
             providers.validate()?;
@@ -6852,6 +6865,11 @@ impl Config {
             .filter(|s| !s.is_empty())
             .map(expand_path)
             .collect()
+    }
+
+    #[must_use]
+    pub fn auto_review_disabled(&self) -> bool {
+        self.auto_review.as_ref().is_some_and(|cfg| cfg.disabled)
     }
 
     /// Whether the user-memory feature is enabled. The default is **off**
@@ -12973,6 +12991,66 @@ mod credential_scope_tests {
         assert!(
             !project.contains("workspace-rescope-openrouter-key"),
             "credential leaked into workspace config: {project}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn managed_auto_review_disabled_replaces_user_table_and_refuses_auto_policy() -> Result<()> {
+        let _lock = lock_test_env();
+        let temp = tempfile::tempdir()?;
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home)?;
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", home.as_os_str());
+        let user_config = home.join("config.toml");
+        let managed_config = temp.path().join("managed.toml");
+        let _managed =
+            EnvVarGuard::set("CODEWHALE_MANAGED_CONFIG_PATH", managed_config.as_os_str());
+        let _policy = EnvVarGuard::remove("CODEWHALE_APPROVAL_POLICY");
+        let _legacy_policy = EnvVarGuard::remove("DEEPSEEK_APPROVAL_POLICY");
+
+        fs::write(
+            &user_config,
+            r#"
+[[auto_review.allow]]
+tool = "read"
+reason = "user allow"
+"#,
+        )?;
+        fs::write(
+            &managed_config,
+            r#"
+[auto_review]
+disabled = true
+"#,
+        )?;
+
+        let loaded = Config::load(Some(user_config.clone()), None)?;
+        assert!(loaded.auto_review_disabled());
+        assert!(
+            loaded
+                .auto_review
+                .as_ref()
+                .is_some_and(|cfg| cfg.allow.is_empty() && cfg.block.is_empty()),
+            "managed [auto_review] table must replace the user table"
+        );
+
+        fs::write(&user_config, "approval_policy = \"auto\"\n")?;
+        let file_err = Config::load(Some(user_config.clone()), None)
+            .expect_err("approval_policy = auto must fail when auto_review.disabled = true");
+        assert!(
+            file_err.to_string().contains("auto_review.disabled = true"),
+            "unexpected error for config approval_policy: {file_err:#}"
+        );
+
+        fs::write(&user_config, "")?;
+        let _env_policy = EnvVarGuard::set("CODEWHALE_APPROVAL_POLICY", "auto");
+        let env_err = Config::load(Some(user_config), None).expect_err(
+            "CODEWHALE_APPROVAL_POLICY=auto must fail when auto_review.disabled = true",
+        );
+        assert!(
+            env_err.to_string().contains("auto_review.disabled = true"),
+            "unexpected error for CODEWHALE_APPROVAL_POLICY: {env_err:#}"
         );
         Ok(())
     }
