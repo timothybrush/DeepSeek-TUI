@@ -250,9 +250,13 @@ Legacy note: `/set approval_mode ...` was retired in favor of `/config`.
   presence signal (`owner_present`), neither of which can be supplied by a
   host or request field. Two layers decide approvals. The **deterministic
   floor** (configured block rules plus the built-in safety floor) allows
-  proven-safe calls and hard-blocks publish-like actions and destructive
+  proven-safe calls, hard-blocks publish-like actions and destructive
   unattended work (`Background`, `Headless`, or any turn where `owner_present`
-  is false); it is never model-reviewed and never waits for an approval card.
+  is false), and holds critical-path deletions (filesystem root, home folder,
+  the project root or any ancestor of it, and `.git` folders) so interactive
+  sessions with `owner_present` ask you while unattended or headless sessions
+  refuse; it is never model-reviewed and never waits for an approval card on
+  other holds or unattended work.
   Fallback holds — calls the deterministic engine could not prove safe —
   escalate to a one-shot **model guardian** (v0.9.8) that returns risk,
   allow/deny, and a rationale. The guardian sees the exact held call and
