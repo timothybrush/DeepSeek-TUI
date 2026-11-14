@@ -1677,3 +1677,142 @@ async fn child_gate_observation_is_owned_once_and_full_channel_respects_original
         );
     }
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn child_authority_records_settled_writes_across_aliases_into_mailbox() {
+    use crate::tools::subagent::{Mailbox, MailboxMessage};
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let _home = crate::test_support::SealedHome::at(&root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    let (_parent, _parent_handle, base_authority, route) = fixture(&root, None);
+    let (mailbox, mut rx) = Mailbox::new(CancellationToken::new());
+    let mut runtime = base_authority.runtime.clone().with_mailbox(mailbox);
+    runtime.context.workspace = root.clone();
+    runtime.worker_profile =
+        codewhale_agent_contract::worker_profile::WorkerRuntimeProfile::for_role(
+            FleetRole::Builder,
+        );
+    runtime.context.approval_mode = ApprovalMode::Bypass;
+    runtime.context.auto_approve = true;
+    let worker_id = {
+        let mut manager = runtime.manager.write().await;
+        let worker_id = manager
+            .insert_test_running_direct_child_in_origin(
+                "alias-writer",
+                &root,
+                &root,
+                "origin-session",
+            )
+            .unwrap();
+        manager
+            .register_test_write_claim(&worker_id, vec!["src".to_string()], &root)
+            .unwrap();
+        worker_id
+    };
+    let authority = ChildAuthority::capture(
+        runtime,
+        FleetRole::Builder,
+        worker_id.clone(),
+        "writer".into(),
+        None,
+    );
+    let (child, _child_handle) = Engine::new_child_admitted(
+        EngineConfig {
+            workspace: root.clone(),
+            model: DEFAULT_TEXT_MODEL.into(),
+            allow_shell: true,
+            snapshots_enabled: false,
+            memory_enabled: false,
+            ..Default::default()
+        },
+        authority.runtime.api_config.as_deref().unwrap(),
+        authority.clone(),
+        SystemPrompt::Text("captured child role".into()),
+        None,
+    )
+    .unwrap();
+    let build = child.acp_tool_build(
+        &TurnAuthority::from_effective_fields(
+            AppMode::Agent,
+            true,
+            false,
+            true,
+            ApprovalMode::Bypass,
+        ),
+        &route,
+        None,
+    );
+    build
+        .surface
+        .registry
+        .execute_full(
+            "File",
+            json!({"action": "write", "file_path": "src/via_file.txt", "content": "one\n"}),
+        )
+        .await
+        .unwrap();
+    for (tool, input) in [
+        (
+            "write_file",
+            json!({"file_path": "src/via_snake.txt", "content": "two\n"}),
+        ),
+        (
+            "edit_file",
+            json!({"filePath": "src/via_camel.txt", "old_str": "a", "new_str": "b"}),
+        ),
+        (
+            "File",
+            json!({
+                "action": "patch",
+                "file_path": "src/patched.txt",
+                "patch": "--- a/src/patched.txt\n+++ b/src/patched.txt\n@@ -1 +1 @@\n-old\n+new\n"
+            }),
+        ),
+        (
+            "apply_patch",
+            json!({
+                "patch": "--- a/src/first.rs\n+++ b/src/first.rs\n@@ -1 +1 @@\n-a\n+b\n--- /dev/null\n+++ b/src/second.rs\n@@ -0,0 +1 @@\n+hi\n"
+            }),
+        ),
+    ] {
+        let claimed = authority
+            .validate_claim(&build.surface.registry, tool, &input)
+            .await
+            .unwrap();
+        authority.record_settled_writes(claimed).await;
+    }
+
+    let recorded: Vec<String> = rx
+        .drain_available()
+        .into_iter()
+        .flat_map(|env| match env.message {
+            MailboxMessage::FileWrites {
+                agent_id,
+                turn_seq,
+                paths,
+            } => {
+                assert_eq!(agent_id, worker_id);
+                assert_eq!(turn_seq, 0);
+                paths
+            }
+            other => panic!("unexpected mailbox message: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        recorded,
+        vec![
+            "src/via_file.txt",
+            "src/via_snake.txt",
+            "src/via_camel.txt",
+            "src/patched.txt",
+            "src/first.rs",
+            "src/second.rs",
+        ]
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("src/via_file.txt")).unwrap(),
+        "one\n"
+    );
+}

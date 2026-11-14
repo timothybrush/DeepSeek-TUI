@@ -2111,6 +2111,8 @@ pub struct App {
     pub agent_progress: HashMap<String, String>,
     /// Parent/depth metadata for live progress-only sub-agent rows.
     pub agent_progress_meta: HashMap<String, AgentProgressMeta>,
+    pub delegated_writes:
+        std::collections::BTreeMap<(String, u64), std::collections::BTreeSet<String>>,
     /// In-transcript sub-agent card index by `agent_id` (issue #128).
     /// Maps each live sub-agent to the `HistoryCell::SubAgent` it renders
     /// into, so successive mailbox envelopes mutate the same cell rather
@@ -5696,6 +5698,7 @@ impl App {
         self.session_context_references.clear();
         self.session_artifacts.clear();
         self.session_turn_outcomes.clear();
+        self.delegated_writes.clear();
         self.prune_transcript_index_state(0);
         self.history_version = self.history_version.wrapping_add(1);
         self.needs_redraw = true;
@@ -6033,6 +6036,7 @@ impl App {
         self.api_messages_mut().clear();
         self.api_message_stamps.clear();
         self.session_turn_outcomes.clear();
+        self.delegated_writes.clear();
     }
 
     #[must_use]

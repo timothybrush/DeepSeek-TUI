@@ -859,7 +859,8 @@ fn authority_mutation_paths(name: &str, input: &Value) -> Result<Option<Vec<Stri
     let is_patch = canonical == "apply_patch"
         || (name == "File" && input.get("action").and_then(Value::as_str) == Some("patch"));
     if is_patch {
-        let mut patch_input = input.clone();
+        let mut patch_input =
+            codewhale_tools::param_alias::with_canonical_path_argument(input).into_owned();
         if let Some(object) = patch_input.as_object_mut() {
             object.remove("action");
         }
@@ -878,20 +879,27 @@ fn authority_mutation_paths(name: &str, input: &Value) -> Result<Option<Vec<Stri
     if !path_bound {
         return Ok(None);
     }
-    Ok(Some(
-        mutation_target_path(name, input)
-            .map(|path| vec![path.to_string()])
-            .unwrap_or_default(),
-    ))
+    Ok(Some(mutation_target_paths(name, input)))
 }
 
-pub(crate) fn mutation_target_path<'a>(name: &str, input: &'a Value) -> Option<&'a str> {
-    let field = if name == "pandoc_convert" {
-        "output_path"
-    } else {
-        "path"
-    };
-    input.get(field).and_then(Value::as_str)
+pub(crate) fn mutation_target_paths(name: &str, input: &Value) -> Vec<String> {
+    if name == "pandoc_convert" {
+        return input
+            .get("output_path")
+            .and_then(Value::as_str)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+    }
+    let mut paths = Vec::new();
+    for key in codewhale_tools::param_alias::path_argument_keys() {
+        if let Some(path) = input.get(key).and_then(Value::as_str)
+            && !paths.iter().any(|seen| seen == path)
+        {
+            paths.push(path.to_string());
+        }
+    }
+    paths
 }
 
 /// Builder for constructing a `ToolRegistry` with common tools.

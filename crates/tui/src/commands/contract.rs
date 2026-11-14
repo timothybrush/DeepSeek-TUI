@@ -419,6 +419,11 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
             .unwrap_or_else(|| "(none)".to_string());
         app.clear_history();
         app.session_turn_outcomes = session.turn_outcomes.clone();
+        app.delegated_writes = session
+            .delegated_writes
+            .iter()
+            .map(|(seq, paths)| ((session_id.clone(), *seq), paths.iter().cloned().collect()))
+            .collect();
         app.session_artifacts = session.artifacts.clone();
         app.session_context_references = session.context_references.clone();
         app.extend_history(session.messages.iter().flat_map(|message| {

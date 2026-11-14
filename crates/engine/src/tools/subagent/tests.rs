@@ -29112,3 +29112,53 @@ fn claim_and_carve_out_paths_name_the_file_convert_writes() {
         vec!["src/new.txt".to_string()]
     );
 }
+
+#[test]
+fn claim_and_carve_out_paths_recognize_file_path_aliases_and_file_tool_actions() {
+    let workspace = tempdir().expect("tempdir");
+    for (tool, input, expected) in [
+        (
+            "write_file",
+            serde_json::json!({"file_path": "src/via_snake.txt", "content": "x"}),
+            vec!["src/via_snake.txt".to_string()],
+        ),
+        (
+            "edit_file",
+            serde_json::json!({"filePath": "src/via_camel.txt", "old_str": "a", "new_str": "b"}),
+            vec!["src/via_camel.txt".to_string()],
+        ),
+        (
+            "File",
+            serde_json::json!({"action": "write", "file_path": "src/file_write.txt", "content": "x"}),
+            vec!["src/file_write.txt".to_string()],
+        ),
+        (
+            "File",
+            serde_json::json!({"action": "edit", "filePath": "src/file_edit.txt", "old_str": "a", "new_str": "b"}),
+            vec!["src/file_edit.txt".to_string()],
+        ),
+        (
+            "File",
+            serde_json::json!({
+                "action": "patch",
+                "file_path": "src/patched.txt",
+                "patch": "--- a/src/patched.txt\n+++ b/src/patched.txt\n@@ -1 +1 @@\n-old\n+new\n"
+            }),
+            vec!["src/patched.txt".to_string()],
+        ),
+        (
+            "apply_patch",
+            serde_json::json!({
+                "patch": "--- a/src/first.rs\n+++ b/src/first.rs\n@@ -1 +1 @@\n-a\n+b\n--- /dev/null\n+++ b/src/second.rs\n@@ -0,0 +1 @@\n+hi\n"
+            }),
+            vec!["src/first.rs".to_string(), "src/second.rs".to_string()],
+        ),
+    ] {
+        assert_eq!(raw_mutation_target_paths(tool, &input), expected, "{tool}");
+        assert_eq!(
+            mutation_paths(tool, &input, workspace.path()).expect("claim paths"),
+            expected,
+            "{tool}"
+        );
+    }
+}

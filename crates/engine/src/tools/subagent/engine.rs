@@ -389,15 +389,12 @@ impl ChildAuthority {
         input: &Value,
     ) -> Result<Vec<String>> {
         self.validate(registry, name, input)?;
+        let canonical = codewhale_execpolicy::canonical_action::canonical_action_alias(name, input);
         let scope_aware_write = matches!(
-            name,
+            canonical,
             "write" | "edit" | "write_file" | "edit_file" | "apply_patch" | "fim_edit"
-        ) || (name == "File"
-            && input
-                .get("action")
-                .and_then(Value::as_str)
-                .is_some_and(|action| matches!(action, "write" | "edit" | "patch")))
-            || (name == "pandoc_convert" && input.get("output_path").is_some());
+        ) || (name == "pandoc_convert"
+            && input.get("output_path").is_some());
         if scope_aware_write && self.enforce_write_claim {
             let paths = mutation_paths(name, input, &self.runtime.context.workspace)?;
             if paths.is_empty() {
@@ -475,6 +472,20 @@ impl ChildAuthority {
             return;
         }
         let mut manager = self.coordination_manager.write().await;
+        let shared_checkout = manager
+            .worker_records
+            .get(&self.owner_agent_id)
+            .is_some_and(|record| {
+                normalize_subagent_workspace(&record.spec.workspace)
+                    == normalize_subagent_workspace(&manager.workspace)
+            });
+        if shared_checkout && let Some(mailbox) = self.runtime.mailbox.as_ref() {
+            let _ = mailbox.send(MailboxMessage::FileWrites {
+                agent_id: self.owner_agent_id.clone(),
+                turn_seq: 0,
+                paths: paths.clone(),
+            });
+        }
         if let Some(record) = manager.worker_records.get_mut(&self.owner_agent_id) {
             record.delivery_evidence.observed_writes.extend(paths);
         }

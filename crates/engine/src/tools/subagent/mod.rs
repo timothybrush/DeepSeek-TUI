@@ -9435,6 +9435,27 @@ impl SubAgentManager {
         Ok(id)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn register_test_write_claim(
+        &mut self,
+        owner: &str,
+        roots: Vec<String>,
+        workspace: &Path,
+    ) -> Result<(), String> {
+        let claim = self.namespace_write_claim(
+            workspace,
+            false,
+            WriteScopeClaim {
+                owner: owner.to_string(),
+                roots,
+                exact_files: Vec::new(),
+                contracts: Vec::new(),
+            },
+        )?;
+        self.register_claim_with_presence(claim, false, workspace)?;
+        Ok(())
+    }
+
     /// Test helper: seed a settled direct child whose result has not yet been
     /// delivered to the parent.
     #[cfg(any(test, feature = "test-support"))]
@@ -21778,10 +21799,12 @@ fn is_internal_coordination_state_tool(name: &str) -> bool {
 /// the field the tool writes through. Feeds the child write carve-out (#5186);
 /// claim enforcement keeps using the normalized [`mutation_paths`].
 fn raw_mutation_target_paths(name: &str, input: &Value) -> Vec<String> {
-    if name == "apply_patch"
+    let canonical = codewhale_execpolicy::canonical_action::canonical_action_alias(name, input);
+    if canonical == "apply_patch"
         || (name == "File" && input.get("action").and_then(Value::as_str) == Some("patch"))
     {
-        let mut patch_input = input.clone();
+        let mut patch_input =
+            codewhale_tools::param_alias::with_canonical_path_argument(input).into_owned();
         if let Some(object) = patch_input.as_object_mut() {
             object.remove("action");
         }
@@ -21789,26 +21812,24 @@ fn raw_mutation_target_paths(name: &str, input: &Value) -> Vec<String> {
             .map(|preflight| preflight.touched_files)
             .unwrap_or_default();
     }
-    crate::tools::registry::mutation_target_path(name, input)
-        .map(|path| vec![path.to_string()])
-        .unwrap_or_default()
+    crate::tools::registry::mutation_target_paths(name, input)
 }
 
 fn mutation_paths(name: &str, input: &Value, workspace: &Path) -> Result<Vec<String>> {
-    let raw_paths = if name == "apply_patch"
+    let canonical = codewhale_execpolicy::canonical_action::canonical_action_alias(name, input);
+    let raw_paths = if canonical == "apply_patch"
         || (name == "File" && input.get("action").and_then(Value::as_str) == Some("patch"))
     {
-        let mut patch_input = input.clone();
+        let mut patch_input =
+            codewhale_tools::param_alias::with_canonical_path_argument(input).into_owned();
         if let Some(object) = patch_input.as_object_mut() {
             object.remove("action");
         }
         codewhale_tools::patch_preflight::preflight_apply_patch(&patch_input)
             .map_err(|err| anyhow!(err.to_string()))?
             .touched_files
-    } else if let Some(path) = crate::tools::registry::mutation_target_path(name, input) {
-        vec![path.to_string()]
     } else {
-        Vec::new()
+        crate::tools::registry::mutation_target_paths(name, input)
     };
     // One normalization per batch, not per path: every absolute spelling
     // below strips against the same canonical workspace.

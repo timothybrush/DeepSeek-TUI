@@ -1398,7 +1398,14 @@ pub(super) async fn apply_conversation_undo(
     app.ignored_tool_calls.clear();
     app.mark_history_updated();
     let persistence = async {
-        let manager = tokio::task::spawn_blocking(SessionManager::default_location).await??;
+        #[cfg(test)]
+        let env_scope = crate::test_support::env_scope_ticket();
+        let manager = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            let _env_scope = crate::test_support::join_env_scope(env_scope);
+            SessionManager::default_location()
+        })
+        .await??;
         let session = build_session_snapshot(app, &manager).map_err(anyhow::Error::msg)?;
         let projection = saved_work_projection(app, &session);
         anyhow::ensure!(
@@ -1504,7 +1511,15 @@ pub(super) async fn apply_range_undo(
     );
     draw_app_frame_inner(terminal, app, config, false)?;
     let input = commands::undo_range_input(app, cut)?;
-    let plan = tokio::task::spawn_blocking(move || commands::plan_undo_range(input)).await??;
+    #[cfg(test)]
+    let env_scope = crate::test_support::env_scope_ticket();
+    let plan = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _env_scope = crate::test_support::join_env_scope(env_scope);
+        commands::plan_undo_range(input)
+    })
+    .await??;
+    let undone_turn_seqs = plan.undone_turn_seqs.clone();
     anyhow::ensure!(
         engine.get_session_snapshot().await? == before,
         "The conversation changed during undo preparation; nothing was undone."
@@ -1515,10 +1530,27 @@ pub(super) async fn apply_range_undo(
         StatusToast::new(progress, StatusToastLevel::Info, Some(4_000)).for_command_receipt(),
     );
     draw_app_frame_inner(terminal, app, config, false)?;
-    let (restored, _restore_guard) =
-        tokio::task::spawn_blocking(move || (commands::restore_undo_range(plan), restore_guard))
-            .await?;
+    #[cfg(test)]
+    let env_scope = crate::test_support::env_scope_ticket();
+    let (restored, _restore_guard) = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _env_scope = crate::test_support::join_env_scope(env_scope);
+        (commands::restore_undo_range(plan), restore_guard)
+    })
+    .await?;
     let summary = restored?;
+    let removed_delegated_writes: Vec<((String, u64), std::collections::BTreeSet<String>)> =
+        if let Some(session_id) = app.current_session_id.as_deref() {
+            undone_turn_seqs
+                .iter()
+                .filter_map(|seq| {
+                    let key = (session_id.to_string(), *seq);
+                    app.delegated_writes.remove(&key).map(|paths| (key, paths))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
     let progress = format!("Saving conversation rewind for {} requests…", depth + 1);
     app.status_message = Some(progress.clone());
     app.push_status_toast_record(
@@ -1542,9 +1574,12 @@ pub(super) async fn apply_range_undo(
         Ok(Some(error)) => anyhow::bail!(
             "{summary} Conversation rewound, but could not be saved: {error:#}. The pre-restore safety snapshot retains the former workspace files."
         ),
-        Err(error) => anyhow::bail!(
-            "{summary} Conversation rewind failed: {error:#}. The original conversation and pre-restore safety snapshot retain recovery evidence."
-        ),
+        Err(error) => {
+            app.delegated_writes.extend(removed_delegated_writes);
+            anyhow::bail!(
+                "{summary} Conversation rewind failed: {error:#}. The original conversation and pre-restore safety snapshot retain recovery evidence."
+            )
+        }
     }
 }
 
@@ -4893,6 +4928,17 @@ pub(crate) fn apply_loaded_session_with_goal(
     }
     app.session_artifacts = session.artifacts;
     app.session_turn_outcomes = session.turn_outcomes;
+    app.delegated_writes = app
+        .current_session_id
+        .as_ref()
+        .map(|owner| {
+            session
+                .delegated_writes
+                .into_iter()
+                .map(|(seq, paths)| ((owner.clone(), seq), paths.into_iter().collect()))
+                .collect()
+        })
+        .unwrap_or_default();
     app.window_title = session.window_title;
     app.composer_color = session.composer_color;
     app.workspace_context = None;

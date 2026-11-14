@@ -2849,6 +2849,7 @@ fn sample_turn(thread_id: &str, turn_id: &str, status: RuntimeTurnStatus) -> Tur
         artifacts: Vec::new(),
         workspace: None,
         workspace_snapshots: Vec::new(),
+        delegated_writes: Vec::new(),
     }
 }
 
@@ -20207,6 +20208,7 @@ fn opening_manager_recovers_stale_queued_and_in_progress_work() -> Result<()> {
         artifacts: Vec::new(),
         workspace: None,
         workspace_snapshots: Vec::new(),
+        delegated_writes: Vec::new(),
     })?;
     manager.store.save_turn(&TurnRecord {
         source_usage_origin_turn_id: None,
@@ -20253,6 +20255,7 @@ fn opening_manager_recovers_stale_queued_and_in_progress_work() -> Result<()> {
         artifacts: Vec::new(),
         workspace: None,
         workspace_snapshots: Vec::new(),
+        delegated_writes: Vec::new(),
     })?;
     drop(manager);
 
@@ -20457,6 +20460,7 @@ fn seed_turns_with_user_messages(
             artifacts: Vec::new(),
             workspace: None,
             workspace_snapshots: Vec::new(),
+            delegated_writes: Vec::new(),
         })?;
         turn_ids.push(turn_id);
     }
@@ -21222,6 +21226,7 @@ fn restart_rebuild_restores_tool_call_identity_from_persisted_items() -> Result<
         artifacts: Vec::new(),
         workspace: None,
         workspace_snapshots: Vec::new(),
+        delegated_writes: Vec::new(),
     })?;
 
     let turns = manager.store.list_turns_for_thread(&thread.id)?;
@@ -21515,6 +21520,7 @@ fn restart_rebuild_keeps_in_flight_tool_call_identity() -> Result<()> {
         artifacts: Vec::new(),
         workspace: None,
         workspace_snapshots: Vec::new(),
+        delegated_writes: Vec::new(),
     })?;
 
     let turns = manager.store.list_turns_for_thread(&thread.id)?;
@@ -21623,6 +21629,7 @@ fn restart_rebuild_skips_steers_the_engine_never_delivered() -> Result<()> {
         artifacts: Vec::new(),
         workspace: None,
         workspace_snapshots: Vec::new(),
+        delegated_writes: Vec::new(),
     })?;
 
     let turns = manager.store.list_turns_for_thread(&thread.id)?;
@@ -21732,6 +21739,7 @@ fn restart_rebuild_skips_legacy_tool_items_without_identity() -> Result<()> {
         artifacts: Vec::new(),
         workspace: None,
         workspace_snapshots: Vec::new(),
+        delegated_writes: Vec::new(),
     })?;
 
     let turns = manager.store.list_turns_for_thread(&thread.id)?;
@@ -26910,5 +26918,123 @@ async fn async_completion_wake_monitors_background_shell_after_turn_settlement()
 
     tokio::time::sleep(Duration::from_millis(250)).await;
     assert_eq!(manager.store.list_turns_for_thread(&thread.id)?.len(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn subagent_mailbox_file_writes_are_attributed_for_turn_undo() -> Result<()> {
+    use crate::tools::subagent::MailboxMessage;
+
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let harness = install_mock_engine(&manager, &thread.id).await;
+    let mut rx_op = harness.rx_op;
+    let tx_event = harness.tx_event;
+    let thread_id = thread.id.clone();
+
+    tokio::spawn(async move {
+        while let Some(op) = rx_op.recv().await {
+            if let Op::SendMessage(_) = op {
+                let _ = tx_event
+                    .send(EngineEvent::TurnStarted {
+                        previous_source: None,
+                        turn_id: "engine_delegated_1".into(),
+                        created_at: Utc::now(),
+                        route: None,
+                        submission_id: None,
+                    })
+                    .await;
+                for (seq, agent_id, paths) in [
+                    (
+                        1u64,
+                        "agent_a",
+                        vec!["agent_a_1.txt".to_string(), "agent_a_2.txt".to_string()],
+                    ),
+                    (
+                        2u64,
+                        "agent_b",
+                        vec!["agent_b_1.txt".to_string(), "agent_b_2.txt".to_string()],
+                    ),
+                    (
+                        3u64,
+                        "agent_c",
+                        vec![
+                            "agent_c_1.txt".to_string(),
+                            "agent_c_2.txt".to_string(),
+                            "agent_a_1.txt".to_string(),
+                        ],
+                    ),
+                ] {
+                    let _ = tx_event
+                        .send(EngineEvent::SubAgentMailbox {
+                            owner_session_id: thread_id.clone(),
+                            turn_id: "engine_delegated_1".into(),
+                            seq,
+                            message: MailboxMessage::FileWrites {
+                                agent_id: agent_id.into(),
+                                turn_seq: 1,
+                                paths,
+                            },
+                        })
+                        .await;
+                }
+                let _ = tx_event
+                    .send(EngineEvent::MessageStarted { index: 0 })
+                    .await;
+                let _ = tx_event
+                    .send(EngineEvent::MessageDelta {
+                        index: 0,
+                        content: "three workers edited six files".into(),
+                    })
+                    .await;
+                let _ = tx_event
+                    .send(EngineEvent::MessageComplete { index: 0 })
+                    .await;
+                let _ = tx_event
+                    .send(EngineEvent::TurnComplete {
+                        source_accounting: false,
+                        turn_id: None,
+                        submission_id: None,
+                        compaction_id: None,
+                        usage: Usage::default(),
+                        parent_route_usage: Usage::default(),
+                        routed_usage_dropped_records: 0,
+                        status: TurnOutcomeStatus::Completed,
+                        error: None,
+                        tool_catalog: None,
+                        base_url: None,
+                    })
+                    .await;
+                break;
+            }
+        }
+    });
+
+    let turn = manager
+        .start_turn(
+            &thread.id,
+            StartTurnRequest {
+                prompt: "fan out edits".into(),
+                ..Default::default()
+            },
+        )
+        .await?;
+    let settled = wait_for_terminal_turn(&manager, &turn.id).await?;
+    assert_eq!(settled.status, RuntimeTurnStatus::Completed);
+    let expected = vec![
+        "agent_a_1.txt".to_string(),
+        "agent_a_2.txt".to_string(),
+        "agent_b_1.txt".to_string(),
+        "agent_b_2.txt".to_string(),
+        "agent_c_1.txt".to_string(),
+        "agent_c_2.txt".to_string(),
+    ];
+    assert_eq!(settled.delegated_writes, expected);
+    assert_eq!(
+        manager.store.load_turn(&turn.id)?.delegated_writes,
+        expected
+    );
     Ok(())
 }

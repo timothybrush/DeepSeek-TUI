@@ -2090,6 +2090,8 @@ pub struct SavedSession {
     /// record resume, export, and the Runtime API read back.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub turn_outcomes: Vec<SavedTurnOutcome>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub delegated_writes: std::collections::BTreeMap<u64, Vec<String>>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -2322,6 +2324,7 @@ impl SavedSession {
             composer_color: None,
             last_auto_route: None,
             turn_outcomes: Vec::new(),
+            delegated_writes: std::collections::BTreeMap::new(),
             agent_preset: None,
         })
     }
@@ -7083,6 +7086,7 @@ fn create_saved_session_inner(
         composer_color: None,
         last_auto_route: None,
         turn_outcomes: Vec::new(),
+        delegated_writes: std::collections::BTreeMap::new(),
         agent_preset: None,
     }
 }

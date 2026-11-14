@@ -1420,6 +1420,12 @@ pub(crate) fn build_session_snapshot(
     session.context_references = app.session_context_references.clone();
     session.artifacts = app.session_artifacts.clone();
     session.turn_outcomes = app.session_turn_outcomes.clone();
+    session.delegated_writes = app
+        .delegated_writes
+        .iter()
+        .filter(|((owner, _), _)| owner == &session.metadata.id)
+        .map(|((_, seq), paths)| (*seq, paths.iter().cloned().collect()))
+        .collect();
     session.work_state = work_state;
     session.last_auto_route = app.auto_route_for_persistence();
     session.window_title.clone_from(&app.window_title);
