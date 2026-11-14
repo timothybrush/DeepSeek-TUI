@@ -892,14 +892,6 @@ fn conversation_mode_label_shows_creator_and_nothing_for_standard() {
         let mut creator = frame_app();
         creator.install_conversation_mode(Some("creator".to_string()), None);
         let rows = draw(&mut creator, width, height);
-        println!(
-            "--- footer, Creator mode, {width}x{height}\n{}",
-            rows.iter()
-                .map(|row| row.trim_end())
-                .filter(|row| !row.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
         assert_eq!(
             count_rows_containing(&rows, "Creator mode"),
             1,

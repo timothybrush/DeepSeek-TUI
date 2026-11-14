@@ -2048,6 +2048,14 @@ fn shell_params_are_destructive_like(params: &Value, workspace: Option<&std::pat
                 .is_none_or(|argvs| argvs.iter().any(|argv| argv_is_destroyer(argv, None))))
 }
 
+fn is_destroyer_rooted_target(target: &str) -> bool {
+    let bytes = target.as_bytes();
+    target.starts_with('/')
+        || target.starts_with("\\\\")
+        || (cfg!(windows) && target.starts_with('\\'))
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+}
+
 /// The background/headless floor, which Full Access skips, must hold
 /// genuinely catastrophic writes even when `command_safety` (tuned to avoid
 /// over-blocking build/test chains) rates them merely `RequiresApproval`:
@@ -2076,7 +2084,7 @@ fn argv_is_destroyer(argv: &[String], workspace: Option<&std::path::Path>) -> bo
                         recursive |= flag.contains(['r', 'R']);
                         force |= flag.contains('f');
                     }
-                    target if target.starts_with('/') => {
+                    target if is_destroyer_rooted_target(target) => {
                         outside_target |= !strictly_inside(workspace, target);
                     }
                     _ => {}
@@ -2099,7 +2107,10 @@ fn strictly_inside(workspace: Option<&std::path::Path>, target: &str) -> bool {
     let Some(workspace) = workspace else {
         return false;
     };
-    if target.contains(['*', '?', '[', ']', '{', '}', '~', '$'])
+    let has_tilde_expansion =
+        target.starts_with('~') || target.contains("/~") || target.contains("\\~");
+    if has_tilde_expansion
+        || target.contains(['*', '?', '[', ']', '{', '}', '$'])
         || codewhale_snapshot::repo::unsafe_workspace_snapshot_reason(
             &workspace
                 .canonicalize()
@@ -5357,6 +5368,28 @@ mod tests {
             "xargs -0 rm -rf /etc",
         ] {
             assert!(destroyer_held(workspace.path(), command), "{command}");
+        }
+    }
+
+    #[test]
+    fn windows_drive_and_unc_forced_deletes_are_destroyers() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        for command in [
+            r#"rm -rf "C:\Users\RUNNER~1\AppData\Local\Temp\outside""#,
+            r"rm -rf C:\Users\RUNNER~1\AppData\Local\Temp\outside",
+            r#"rm -rf "C:/Users/RUNNER~1/AppData/Local/Temp/outside""#,
+            r#"rm -rf "\\\\server\\share\\outside""#,
+        ] {
+            assert!(destroyer_held(workspace.path(), command), "{command}");
+        }
+        #[cfg(windows)]
+        {
+            let inside = workspace.path().join("build");
+            std::fs::create_dir_all(&inside).unwrap();
+            assert!(!destroyer_held(
+                workspace.path(),
+                &format!("rm -rf \"{}\"", inside.display())
+            ));
         }
     }
 

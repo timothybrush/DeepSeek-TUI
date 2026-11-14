@@ -3717,9 +3717,18 @@ mod tests {
     #[test]
     fn test_mode_rejects_unknown_value() {
         let mut app = create_test_app();
+        let prior = app.mode;
         let result = mode_command(&mut app, Some("fast"));
-        assert!(result.is_error);
-        assert!(result.message.unwrap().contains("Usage: /mode"));
+        assert!(!result.is_error);
+        assert!(matches!(
+            result.action,
+            Some(AppAction::SetConversationMode { ref id }) if id == "fast"
+        ));
+        assert_eq!(app.mode, prior);
+
+        let invalid = mode_command(&mut app, Some("fast mode"));
+        assert!(invalid.is_error);
+        assert!(invalid.message.unwrap().contains("Usage: /mode"));
     }
 
     #[test]

@@ -19997,6 +19997,27 @@ async fn non_output_incomplete_response_is_typed_and_records_usage() {
     assert_eq!(result.result, None);
     assert_eq!(total_tokens, Some(15), "usage must still be recorded");
     assert_partial_tool_was_not_executed(&mailbox);
+
+    let tmp2 = tempdir().expect("tempdir");
+    let (result2, calls2, mailbox2, total_tokens2) =
+        run_incomplete_response_worker(tmp2.path(), "incomplete:model_context_window_exceeded", 4)
+            .await;
+
+    assert_eq!(calls2.load(Ordering::SeqCst), 1);
+    let SubAgentStatus::Failed(reason2) = &result2.status else {
+        panic!("incomplete response must fail, got {:?}", result2.status);
+    };
+    assert!(reason2.contains("response was incomplete"), "{reason2}");
+    assert!(
+        reason2.contains("`model_context_window_exceeded`"),
+        "{reason2}"
+    );
+    assert_eq!(
+        result2.result.as_deref(),
+        Some("partial response diagnostics")
+    );
+    assert_eq!(total_tokens2, Some(15), "usage must still be recorded");
+    assert_partial_tool_was_not_executed(&mailbox2);
 }
 
 #[tokio::test]

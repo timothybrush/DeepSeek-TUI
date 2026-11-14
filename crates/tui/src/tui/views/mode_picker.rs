@@ -551,7 +551,6 @@ mod tests {
             let open = ModePickerView::from_table(AppMode::Agent, Locale::En, &table, None, false);
             let (buf, area) = render_view(open, w, h);
             let text = frame_text(&buf, area);
-            println!("--- /mode picker, blank conversation, creator available, {w}x{h}\n{text}");
             let order = |needle: &str| {
                 text.find(needle)
                     .unwrap_or_else(|| panic!("{needle}: {text}"))
@@ -575,9 +574,6 @@ mod tests {
                 ModePickerView::from_table(AppMode::Agent, Locale::En, &table, None, true);
             let (buf, area) = render_view(locked_standard, w, h);
             let text = frame_text(&buf, area);
-            println!(
-                "--- /mode picker, after the first message, standard conversation, {w}x{h}\n{text}"
-            );
             assert!(
                 text.contains("Fixed after the first message. Start another with /new creator."),
                 "{text}"
@@ -593,9 +589,6 @@ mod tests {
             );
             let (buf, area) = render_view(locked, w, h);
             let text = frame_text(&buf, area);
-            println!(
-                "--- /mode picker, after the first message, creator conversation, {w}x{h}\n{text}"
-            );
             assert!(
                 text.contains("Fixed after the first message. Start another with /new."),
                 "{text}"
@@ -634,7 +627,6 @@ mod tests {
             let view = ModePickerView::from_table(AppMode::Agent, Locale::En, &table, None, false);
             let (buf, area) = render_view(view, 100, 30);
             let text = frame_text(&buf, area);
-            println!("--- /mode picker, creator unavailable ({reason})\n{text}");
             assert!(
                 text.contains("Creator mode"),
                 "listed, never hidden: {text}"

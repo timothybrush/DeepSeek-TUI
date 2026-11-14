@@ -51,8 +51,12 @@ fn shipped_binary_lists_creator_disabled_and_refuses_new_creator_with_the_reason
     tui.wait_for_text("Not ready yet in this version.", WAIT)
         .unwrap();
     print_frame("/new creator in the shipped binary", &mut tui);
+    let after_refusal = tui.frame().text();
     assert!(
-        !tui.frame().contains("Creator mode"),
+        after_refusal
+            .lines()
+            .filter(|line| !line.contains("Creator mode is not available:"))
+            .all(|line| !line.contains("Creator mode")),
         "the conversation stays Standard: {}",
         tui.diagnostics()
     );

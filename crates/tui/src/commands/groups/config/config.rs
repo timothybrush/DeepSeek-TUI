@@ -621,6 +621,7 @@ fn is_conversation_mode_word(arg: &str) -> bool {
     let arg = arg.trim();
     !arg.is_empty()
         && arg.len() <= 64
+        && !arg.chars().all(|c| c.is_ascii_digit())
         && arg
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))

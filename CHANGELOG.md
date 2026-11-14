@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Multi-task background shell waiting (`task_shell_wait`):** `task_shell_wait` now accepts `task_ids` and `until` (`any` or `all`) to poll or wait on multiple background shell commands together while keeping `task_id` for single-task waits, `cancel=true`, and `gate` evidence.
 - **Unmodified DSH plugin compatibility (`CW-8020`):** Admitted unmodified `@deepseek-ai/dsh-*` plugins end-to-end with grant-gated host-service bridges (`workspace`, `llm`, `credentials`, `settings`, `pluginManager`, `deepseekAccount`, `terminal`, `remote`), 9 `host-spine` row bridges, inert/mixed `@deepseek-ai/dsh-agent-presets` handling alongside executable composition rows, duplicate-key `package.json` parsing, sanitized manifest descriptions, a `16,384`-file / `256 MiB` bundle budget, and reviewed `registry.npmjs.org` transitive dependency staging during conversion.
 - **Receipt edit line counts:** `/receipts` and session summaries now count `edit_file` additions and deletions using a line diff of each search/replace pair instead of counting every line of both texts, matching `git diff --stat` and edit cards (with multi-edit calls summed per pair). (CW-8147)
 - **Featured provider disclosure line:** `/provider` and the model picker now show the localized referral disclosure directly below the featured OrcaRouter row across widths (and hide the row when both cannot fit above the list), while keeping `zh-Hans` and mainland China sessions hidden. (CW-8149)
