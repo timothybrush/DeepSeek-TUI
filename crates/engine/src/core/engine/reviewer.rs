@@ -72,10 +72,10 @@ impl ReviewerOutcome {
         match self {
             Self::Allow { reason, .. } => Ok(reason),
             Self::Deny { reason, .. } => Err(ToolError::permission_denied(format!(
-                "Auto-Review guardian denied tool '{tool_name}': {reason}. Do not work around this denial; find a materially safer path or stop."
+                "Auto-Review guardian denied tool '{tool_name}': {reason}. Do not work around this denial: take a materially safer route that stays inside what the person asked for, or stop and say what you need. If the call is needed as written, the person can switch Permissions to Ask to approve it."
             ))),
             Self::Unavailable { reason } => Err(ToolError::permission_denied(format!(
-                "Auto-Review guardian unavailable ({reason}); the call was denied (fail closed). To run it, the person can switch Permissions to Full Access, or to Ask where a prompt can be answered."
+                "Auto-Review guardian unavailable ({reason}); the call was denied (fail closed). Try again once the reviewer is reachable, or the person can switch Permissions to Ask where a prompt can be answered."
             ))),
             Self::Cancelled => Err(ToolError::cancelled(
                 "Auto-Review guardian request cancelled",
@@ -366,6 +366,23 @@ mod tests {
                 reason: "the reviewer answer was incomplete".to_string()
             }
         );
+    }
+
+    #[test]
+    fn block_texts_name_a_way_forward_without_full_access() {
+        for outcome in [
+            ReviewerOutcome::Deny {
+                risk: ReviewerRiskLevel::High,
+                reason: "writes outside the workspace".to_string(),
+            },
+            ReviewerOutcome::Unavailable {
+                reason: "timeout".to_string(),
+            },
+        ] {
+            let text = outcome.into_tool_result("bash").unwrap_err().to_string();
+            assert!(text.contains("Permissions to Ask"), "{text}");
+            assert!(!text.contains("Full Access"), "{text}");
+        }
     }
 
     #[tokio::test]

@@ -635,6 +635,42 @@ fn exec_shell_scenario() {
 
         assert_eq!(decision, None);
     }
+    {
+        let ask_config = EngineConfig {
+            exec_policy_engine: ask_rule_engine("pytest"),
+            ..EngineConfig::default()
+        };
+        assert_eq!(
+            exec_shell_ask_rule_decision(
+                &ask_config,
+                "exec_shell",
+                &json!({"command": "pytest tests/smoke.py"}),
+                Path::new("/repo"),
+                ApprovalMode::Auto,
+            ),
+            Some(ToolAskRuleDecision::Prompt(
+                "Typed ask rule 'tool=exec_shell command=pytest' requires approval.".to_string()
+            ))
+        );
+
+        let deny_engine = codewhale_execpolicy::ExecPolicyEngine::new(
+            vec![],
+            vec!["pytest".to_string(), "cargo test".to_string()],
+        );
+        for command in ["pytest tests/smoke.py", "cargo test --workspace"] {
+            let decision = exec_shell_ask_rule_decision_for_policy(
+                &deny_engine,
+                "exec_shell",
+                &json!({"command": command}),
+                Path::new("/repo"),
+                ApprovalMode::Auto,
+            );
+            assert!(
+                matches!(decision, Some(ToolAskRuleDecision::Block(_))),
+                "{command}: {decision:?}"
+            );
+        }
+    }
 }
 
 #[test]

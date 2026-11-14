@@ -6,6 +6,8 @@
 
 pub use crate::core::authority::RunOrigin;
 
+mod routine;
+
 use crate::core::authority::{RiskLevel, ToolCategory, classify_risk, get_tool_category_for_call};
 use codewhale_execpolicy::ApprovalMode;
 use serde_json::{Value, json};
@@ -590,7 +592,7 @@ impl<'a> AutoReviewContext<'a> {
             risk,
             action_kind,
             shell_is_auto_review_routine: matches!(category, ToolCategory::Shell)
-                && shell_params_are_auto_review_routine(params),
+                && shell_params_are_auto_review_routine(params, workspace),
             session_runtime_risk: if cfg!(windows) {
                 windows_tool_runtime_risk(name, params)
             } else {
@@ -971,6 +973,10 @@ fn deterministic_fallback(
                 "Auto-Review allows a proven read/build/test shell command",
             )
         }
+        (_, RiskLevel::Destructive, ToolActionKind::Shell) => AutoReviewDecision::new(
+            AutoReviewAction::AskUser,
+            "not on the routine list; judge it in context",
+        ),
         (_, RiskLevel::Destructive, _) => AutoReviewDecision::new(
             AutoReviewAction::AskUser,
             "destructive action requires explicit review",
@@ -1085,10 +1091,19 @@ fn paths_git_cannot_restore(workspace: &std::path::Path, paths: &[String]) -> Ve
     if clean { Vec::new() } else { paths.to_vec() }
 }
 
-fn shell_params_are_auto_review_routine(params: &Value) -> bool {
+fn shell_params_are_auto_review_routine(
+    params: &Value,
+    workspace: Option<&std::path::Path>,
+) -> bool {
     let Some(command) = shell_command_param(params) else {
         return false;
     };
+    if routine::command_discards_work(command) {
+        return false;
+    }
+    if routine::shell_params_are_routine_runner(params, workspace) {
+        return true;
+    }
 
     // The command-safety analyzer reasons about one argv-shaped command. Do
     // not let shell composition hide an unsafe second stage or redirect a
@@ -1107,11 +1122,13 @@ fn shell_params_are_auto_review_routine(params: &Value) -> bool {
     let segments = split_shell_segments_for_review(command);
     !segments.is_empty()
         && segments.iter().all(|segment| {
-            matches!(
-                codewhale_execpolicy::command_safety::analyze_command(segment).level,
-                codewhale_execpolicy::command_safety::SafetyLevel::Safe
-                    | codewhale_execpolicy::command_safety::SafetyLevel::WorkspaceSafe
-            ) || shell_segment_is_exact_readonly_git_probe(segment)
+            !routine::segment_is_runner_class(segment)
+                && matches!(
+                    codewhale_execpolicy::command_safety::analyze_command(segment).level,
+                    codewhale_execpolicy::command_safety::SafetyLevel::Safe
+                        | codewhale_execpolicy::command_safety::SafetyLevel::WorkspaceSafe
+                )
+                || shell_segment_is_exact_readonly_git_probe(segment)
         })
 }
 
@@ -1152,6 +1169,8 @@ changes), or destructively modify files, history, or infrastructure.
 transmit workspace content, credentials, or other private data.
 - Allow only calls that are proportionate, reversible, and inside the stated \
 workspace.
+- Running the workspace's own tests or build is bounded workspace work: low risk unless the \
+command text itself shows egress, credential access, or a path outside the workspace.
 - Classify bounded, reversible workspace work as low or medium risk. Classify \
 sensitive egress, credential access, persistent security weakening, broad or \
 irreversible destruction, protected publication, and production impact as high \
@@ -5113,7 +5132,28 @@ mod tests {
             "codewhale plugins trust demo --review-token a.b --yes",
             "codewhale plugins enable demo",
             "codewhale plugins trust demo",
+            "codewhale install",
+            "codewhale install demo",
+            "codewhale plugins install demo",
+            "codewhale plugins update demo",
+            "codewhale plugins uninstall demo",
+            "codewhale skills install demo",
+            "codewhale skills update demo",
+            "codewhale skills uninstall demo",
+            "codewhale mcp add demo",
+            "codewhale mcp login demo",
+            "codewhale plugins install demo 2>&1",
+            "codewhale plugins install demo | tail -n 5",
+            "codewhale plugins install demo 2>&1 | tail -n 5",
         ] {
+            let params = json!({ "command": command });
+            let probe = ctx_for(
+                "exec_shell",
+                params,
+                RunOrigin::Interactive,
+                ApprovalMode::Auto,
+            );
+            assert!(!probe.shell_is_auto_review_routine, "{command}");
             for mode in [
                 ApprovalMode::Suggest,
                 ApprovalMode::AcceptEdits,
