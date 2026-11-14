@@ -1618,27 +1618,40 @@ fn auto_review_scenario() {
 }
 
 #[test]
-fn repo_law_asks_only_in_ask_posture() {
+fn repo_law_asks_only_in_prompt_capable_posture() {
     use ApprovalMode;
 
     assert!(!repo_law_must_block_without_prompt(
         ApprovalMode::Suggest,
-        false
+        false,
+        false,
     ));
-    for mode in [
+    assert!(!repo_law_must_block_without_prompt(
         ApprovalMode::Auto,
-        ApprovalMode::Never,
-        ApprovalMode::Bypass,
-    ] {
+        false,
+        true,
+    ));
+    assert!(repo_law_must_block_without_prompt(
+        ApprovalMode::Auto,
+        false,
+        false,
+    ));
+    assert!(repo_law_must_block_without_prompt(
+        ApprovalMode::Auto,
+        true,
+        true,
+    ));
+    for mode in [ApprovalMode::Never, ApprovalMode::Bypass] {
         assert!(
-            repo_law_must_block_without_prompt(mode, false),
+            repo_law_must_block_without_prompt(mode, false, true),
             "{} must not open a human repo-law approval",
             mode.permission_chip_label()
         );
     }
     assert!(repo_law_must_block_without_prompt(
         ApprovalMode::Suggest,
-        true
+        true,
+        true,
     ));
 }
 

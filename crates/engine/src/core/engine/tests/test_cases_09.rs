@@ -1879,6 +1879,485 @@ async fn run_origin_table_assigns_expected_origin_and_owner_presence() {
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
+async fn auto_review_forced_prompts_reach_interactive_owner_and_hard_blocks_stay_blocked() {
+    use crate::hooks::HookExecutor;
+    use crate::llm_client::mock::{MockLlmClient, canned};
+    use codewhale_config::hooks::{Hook, HookEvent, HooksConfig};
+
+    let _lock = lock_test_env();
+    let config = Config::default();
+
+    let push_workspace = tempdir().expect("tempdir");
+    let push_mock = Arc::new(MockLlmClient::new(vec![
+        canned::tool_call_turn(
+            "call_push_prompt",
+            "Bash",
+            r#"{"action":"run","command":"git push"}"#,
+        ),
+        canned::simple_text_turn("push finished"),
+    ]));
+    let (mut push_engine, mut push_handle) = Engine::new_with_model_client(
+        EngineConfig {
+            workspace: push_workspace.path().to_path_buf(),
+            snapshots_enabled: false,
+            subagents_enabled: false,
+            memory_enabled: false,
+            exec_policy_engine: ask_rule_engine("git push"),
+            ..EngineConfig::default()
+        },
+        &config,
+        push_mock.clone(),
+    );
+    push_engine.attach_owner_surface_for_tests(&mut push_handle);
+    let push_task = tokio::spawn(push_engine.run());
+    push_handle
+        .send(auto_review_message_op("push to remote", &config))
+        .await
+        .expect("send interactive git push with ask rule");
+    let mut push_approval_force_prompt = None;
+    let mut push_started = false;
+    let mut push_rx = push_handle.rx_event.write().await;
+    while let Some(event) = tokio::time::timeout(model_turn_event_timeout(), push_rx.recv())
+        .await
+        .expect("timed out waiting for interactive git push event")
+    {
+        match event {
+            Event::ApprovalRequired {
+                id,
+                tool_name,
+                approval_force_prompt,
+                ..
+            } => {
+                assert_eq!(tool_name, "Bash");
+                push_approval_force_prompt = Some(approval_force_prompt);
+                push_handle
+                    .approve_tool_call(&id)
+                    .await
+                    .expect("approve git push");
+            }
+            Event::ToolCallStarted { .. } => {
+                push_started = true;
+            }
+            Event::TurnComplete { status, error, .. } => {
+                assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
+                break;
+            }
+            _ => {}
+        }
+    }
+    drop(push_rx);
+    assert_eq!(push_approval_force_prompt, Some(true));
+    assert!(
+        push_started,
+        "approved git push must reach tool dispatch past Auto-Review"
+    );
+    assert_eq!(
+        push_mock.call_count(),
+        2,
+        "forced prompt must bypass Guardian consult"
+    );
+    push_handle.send(Op::Shutdown).await.expect("shutdown");
+    tokio::time::timeout(model_turn_event_timeout(), push_task)
+        .await
+        .expect("shutdown timeout")
+        .expect("engine task");
+
+    let blocked_push_workspace = tempdir().expect("tempdir");
+    let blocked_push_mock = Arc::new(MockLlmClient::new(vec![
+        canned::tool_call_turn(
+            "call_push_unforced",
+            "Bash",
+            r#"{"action":"run","command":"git push"}"#,
+        ),
+        canned::simple_text_turn("blocked"),
+    ]));
+    let (mut blocked_push_engine, mut blocked_push_handle) = Engine::new_with_model_client(
+        EngineConfig {
+            workspace: blocked_push_workspace.path().to_path_buf(),
+            snapshots_enabled: false,
+            subagents_enabled: false,
+            memory_enabled: false,
+            ..EngineConfig::default()
+        },
+        &config,
+        blocked_push_mock,
+    );
+    blocked_push_engine.attach_owner_surface_for_tests(&mut blocked_push_handle);
+    let blocked_push_task = tokio::spawn(blocked_push_engine.run());
+    blocked_push_handle
+        .send(auto_review_message_op("unforced push", &config))
+        .await
+        .expect("send unforced git push");
+    let mut unforced_err = None;
+    let mut blocked_rx = blocked_push_handle.rx_event.write().await;
+    while let Some(event) = tokio::time::timeout(model_turn_event_timeout(), blocked_rx.recv())
+        .await
+        .expect("timed out waiting for unforced push")
+    {
+        match event {
+            Event::ApprovalRequired { .. } => {
+                panic!("unforced git push must remain blocked in Auto-Review")
+            }
+            Event::ToolCallComplete { result, .. } => {
+                unforced_err = Some(result.expect_err("unforced git push must fail"));
+            }
+            Event::TurnComplete { .. } => break,
+            _ => {}
+        }
+    }
+    drop(blocked_rx);
+    let unforced_err = unforced_err.expect("tool failure");
+    assert!(
+        unforced_err.to_string().contains("Built-in safety gate"),
+        "{unforced_err}"
+    );
+    blocked_push_handle.send(Op::Shutdown).await.expect("shutdown");
+    tokio::time::timeout(model_turn_event_timeout(), blocked_push_task)
+        .await
+        .expect("shutdown timeout")
+        .expect("engine task");
+
+    let hard_block_workspace = tempdir().expect("tempdir");
+    let hard_block_mock = Arc::new(MockLlmClient::new(vec![
+        canned::tool_call_turn(
+            "call_hidden_bidi",
+            "Bash",
+            "{\"action\":\"run\",\"command\":\"git push \u{202E}origin\"}",
+        ),
+        canned::simple_text_turn("hard blocked"),
+    ]));
+    let (mut hard_block_engine, mut hard_block_handle) = Engine::new_with_model_client(
+        EngineConfig {
+            workspace: hard_block_workspace.path().to_path_buf(),
+            snapshots_enabled: false,
+            subagents_enabled: false,
+            memory_enabled: false,
+            exec_policy_engine: ask_rule_engine("git push"),
+            ..EngineConfig::default()
+        },
+        &config,
+        hard_block_mock,
+    );
+    hard_block_engine.attach_owner_surface_for_tests(&mut hard_block_handle);
+    let hard_block_task = tokio::spawn(hard_block_engine.run());
+    hard_block_handle
+        .send(auto_review_message_op("hidden unicode push", &config))
+        .await
+        .expect("send hidden unicode push");
+    let mut hard_block_err = None;
+    let mut hard_rx = hard_block_handle.rx_event.write().await;
+    while let Some(event) = tokio::time::timeout(model_turn_event_timeout(), hard_rx.recv())
+        .await
+        .expect("timed out waiting for hard block")
+    {
+        match event {
+            Event::ApprovalRequired { .. } => {
+                panic!("hard block must win over ask rule even with owner present")
+            }
+            Event::ToolCallComplete { result, .. } => {
+                hard_block_err = Some(result.expect_err("hard block must fail"));
+            }
+            Event::TurnComplete { .. } => break,
+            _ => {}
+        }
+    }
+    drop(hard_rx);
+    let hard_block_err = hard_block_err.expect("hard block tool error");
+    assert!(
+        hard_block_err.to_string().contains("bidirectional control"),
+        "{hard_block_err}"
+    );
+    hard_block_handle.send(Op::Shutdown).await.expect("shutdown");
+    tokio::time::timeout(model_turn_event_timeout(), hard_block_task)
+        .await
+        .expect("shutdown timeout")
+        .expect("engine task");
+
+    let ask_cmd = if cfg!(windows) {
+        r#"echo {"decision":"ask"}"#
+    } else {
+        r#"echo '{"decision":"ask"}'"#
+    };
+    let hook_executor = Arc::new(HookExecutor::new(
+        HooksConfig {
+            enabled: true,
+            hooks: vec![Hook::new(HookEvent::ToolCallBefore, ask_cmd)],
+            ..HooksConfig::default()
+        },
+        push_workspace.path().to_path_buf(),
+    ));
+    let hook_op = |executor: Arc<HookExecutor>| {
+        let mut op = auto_review_message_op("run hook-gated command", &config);
+        if let Op::SendMessage(ref mut spec) = op {
+            spec.hook_executor = Some(executor);
+        }
+        op
+    };
+
+    let hook_workspace = tempdir().expect("tempdir");
+    let hook_mock = Arc::new(MockLlmClient::new(vec![
+        canned::tool_call_turn(
+            "call_hook_ask",
+            "Bash",
+            r#"{"action":"run","command":"echo hook-ok"}"#,
+        ),
+        canned::simple_text_turn("hook ran"),
+    ]));
+    let (mut hook_engine, mut hook_handle) = Engine::new_with_model_client(
+        EngineConfig {
+            workspace: hook_workspace.path().to_path_buf(),
+            snapshots_enabled: false,
+            subagents_enabled: false,
+            memory_enabled: false,
+            ..EngineConfig::default()
+        },
+        &config,
+        hook_mock,
+    );
+    hook_engine.attach_owner_surface_for_tests(&mut hook_handle);
+    let hook_task = tokio::spawn(hook_engine.run());
+    hook_handle
+        .send(hook_op(hook_executor.clone()))
+        .await
+        .expect("send interactive hook ask");
+    let mut hook_prompted = false;
+    let mut hook_succeeded = false;
+    let mut hook_rx = hook_handle.rx_event.write().await;
+    while let Some(event) = tokio::time::timeout(model_turn_event_timeout(), hook_rx.recv())
+        .await
+        .expect("timed out waiting for interactive hook")
+    {
+        match event {
+            Event::ApprovalRequired {
+                id,
+                approval_force_prompt,
+                ..
+            } => {
+                assert!(approval_force_prompt);
+                hook_prompted = true;
+                hook_handle.approve_tool_call(&id).await.expect("approve hook");
+            }
+            Event::ToolCallComplete { result, .. } => {
+                hook_succeeded = result.expect("approved hook call must run").success;
+            }
+            Event::TurnComplete { status, error, .. } => {
+                assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
+                break;
+            }
+            _ => {}
+        }
+    }
+    drop(hook_rx);
+    assert!(hook_prompted);
+    assert!(hook_succeeded);
+    hook_handle.send(Op::Shutdown).await.expect("shutdown");
+    tokio::time::timeout(model_turn_event_timeout(), hook_task)
+        .await
+        .expect("shutdown timeout")
+        .expect("engine task");
+
+    let headless_hook_mock = Arc::new(MockLlmClient::new(vec![
+        canned::tool_call_turn(
+            "call_hook_unattended",
+            "Bash",
+            r#"{"action":"run","command":"echo hook-never"}"#,
+        ),
+        canned::simple_text_turn("hook refused"),
+    ]));
+    let (headless_hook_engine, headless_hook_handle) = Engine::new_with_model_client(
+        EngineConfig {
+            workspace: hook_workspace.path().to_path_buf(),
+            snapshots_enabled: false,
+            subagents_enabled: false,
+            memory_enabled: false,
+            ..EngineConfig::default()
+        },
+        &config,
+        headless_hook_mock,
+    );
+    let headless_hook_task = tokio::spawn(headless_hook_engine.run());
+    headless_hook_handle
+        .send(hook_op(hook_executor))
+        .await
+        .expect("send unattended hook ask");
+    let mut headless_hook_err = None;
+    let mut headless_hook_rx = headless_hook_handle.rx_event.write().await;
+    while let Some(event) = tokio::time::timeout(model_turn_event_timeout(), headless_hook_rx.recv())
+        .await
+        .expect("timed out waiting for unattended hook")
+    {
+        match event {
+            Event::ApprovalRequired { .. } => {
+                panic!("unattended Auto-Review must not prompt for hook ask")
+            }
+            Event::ToolCallComplete { result, .. } => {
+                headless_hook_err = Some(result.expect_err("unattended hook ask must fail"));
+            }
+            Event::TurnComplete { .. } => break,
+            _ => {}
+        }
+    }
+    drop(headless_hook_rx);
+    let headless_hook_err = headless_hook_err.expect("unattended hook error");
+    assert!(
+        headless_hook_err.to_string().contains("tool_call_before hook"),
+        "{headless_hook_err}"
+    );
+    headless_hook_handle.send(Op::Shutdown).await.expect("shutdown");
+    tokio::time::timeout(model_turn_event_timeout(), headless_hook_task)
+        .await
+        .expect("shutdown timeout")
+        .expect("engine task");
+
+    let law_workspace = tempdir().expect("tempdir");
+    let law_dir = law_workspace.path().join(".codewhale");
+    fs::create_dir_all(&law_dir).expect("create .codewhale");
+    fs::write(
+        law_dir.join("constitution.json"),
+        r#"{
+            "protected_invariants": [{
+                "text": "Release notes need human review",
+                "paths": ["CHANGELOG.md"]
+            }]
+        }"#,
+    )
+    .expect("write constitution");
+
+    let law_mock = Arc::new(MockLlmClient::new(vec![
+        canned::tool_call_turn(
+            "call_repo_law",
+            "File",
+            r#"{"action":"write","path":"CHANGELOG.md","content":"release\n"}"#,
+        ),
+        canned::simple_text_turn("changelog updated"),
+    ]));
+    let (mut law_engine, mut law_handle) = Engine::new_with_model_client(
+        EngineConfig {
+            workspace: law_workspace.path().to_path_buf(),
+            snapshots_enabled: false,
+            subagents_enabled: false,
+            memory_enabled: false,
+            ..EngineConfig::default()
+        },
+        &config,
+        law_mock,
+    );
+    law_engine.attach_owner_surface_for_tests(&mut law_handle);
+    let law_task = tokio::spawn(law_engine.run());
+    law_handle
+        .send(auto_review_message_op("update changelog", &config))
+        .await
+        .expect("send interactive repo law");
+    let mut law_prompted = false;
+    let mut law_rx = law_handle.rx_event.write().await;
+    while let Some(event) = tokio::time::timeout(model_turn_event_timeout(), law_rx.recv())
+        .await
+        .expect("timed out waiting for interactive repo law")
+    {
+        match event {
+            Event::ApprovalRequired {
+                id,
+                approval_force_prompt,
+                ..
+            } => {
+                assert!(approval_force_prompt);
+                law_prompted = true;
+                law_handle
+                    .approve_tool_call(&id)
+                    .await
+                    .expect("approve repo law write");
+            }
+            Event::TurnComplete { status, error, .. } => {
+                assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
+                break;
+            }
+            _ => {}
+        }
+    }
+    drop(law_rx);
+    assert!(law_prompted);
+    assert_eq!(
+        fs::read_to_string(law_workspace.path().join("CHANGELOG.md")).expect("changelog written"),
+        "release\n"
+    );
+    law_handle.send(Op::Shutdown).await.expect("shutdown");
+    tokio::time::timeout(model_turn_event_timeout(), law_task)
+        .await
+        .expect("shutdown timeout")
+        .expect("engine task");
+
+    let unattended_law_workspace = tempdir().expect("tempdir");
+    fs::create_dir_all(unattended_law_workspace.path().join(".codewhale"))
+        .expect("create .codewhale");
+    fs::write(
+        unattended_law_workspace
+            .path()
+            .join(".codewhale/constitution.json"),
+        r#"{
+            "protected_invariants": [{
+                "text": "Release notes need human review",
+                "paths": ["CHANGELOG.md"]
+            }]
+        }"#,
+    )
+    .expect("write constitution");
+    let unattended_law_mock = Arc::new(MockLlmClient::new(vec![
+        canned::tool_call_turn(
+            "call_repo_law_unattended",
+            "File",
+            r#"{"action":"write","path":"CHANGELOG.md","content":"unattended\n"}"#,
+        ),
+        canned::simple_text_turn("refused"),
+    ]));
+    let (unattended_law_engine, unattended_law_handle) = Engine::new_with_model_client(
+        EngineConfig {
+            workspace: unattended_law_workspace.path().to_path_buf(),
+            snapshots_enabled: false,
+            subagents_enabled: false,
+            memory_enabled: false,
+            ..EngineConfig::default()
+        },
+        &config,
+        unattended_law_mock,
+    );
+    let unattended_law_task = tokio::spawn(unattended_law_engine.run());
+    unattended_law_handle
+        .send(auto_review_message_op("unattended changelog", &config))
+        .await
+        .expect("send unattended repo law");
+    let mut unattended_law_err = None;
+    let mut unattended_law_rx = unattended_law_handle.rx_event.write().await;
+    while let Some(event) = tokio::time::timeout(model_turn_event_timeout(), unattended_law_rx.recv())
+        .await
+        .expect("timed out waiting for unattended repo law")
+    {
+        match event {
+            Event::ApprovalRequired { .. } => {
+                panic!("unattended Auto-Review must not prompt for repo law")
+            }
+            Event::ToolCallComplete { result, .. } => {
+                unattended_law_err = Some(result.expect_err("unattended repo law must fail"));
+            }
+            Event::TurnComplete { .. } => break,
+            _ => {}
+        }
+    }
+    drop(unattended_law_rx);
+    let unattended_law_err = unattended_law_err.expect("unattended repo law error");
+    assert!(
+        unattended_law_err.to_string().contains("Repository law"),
+        "{unattended_law_err}"
+    );
+    assert!(!unattended_law_workspace.path().join("CHANGELOG.md").exists());
+    unattended_law_handle.send(Op::Shutdown).await.expect("shutdown");
+    tokio::time::timeout(model_turn_event_timeout(), unattended_law_task)
+        .await
+        .expect("shutdown timeout")
+        .expect("engine task");
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn headless_exec_and_detached_runs_meet_auto_review_unattended_floor_without_prompting() {
     use crate::llm_client::mock::{MockLlmClient, canned};
     use wiremock::matchers::{body_string_contains, method, path};

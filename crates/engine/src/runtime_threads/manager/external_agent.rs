@@ -2041,6 +2041,7 @@ impl RuntimeThreadManager {
                     proposed: None,
                     responder: None,
                     agent_settled: Some(settled_rx),
+                    owner_only: false,
                 });
                 return (id, rx, settled_tx);
             }

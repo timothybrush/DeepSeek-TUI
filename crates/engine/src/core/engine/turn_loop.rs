@@ -566,14 +566,17 @@ pub(super) fn call_forces_prompt(
         || crate::tools::approval_cache::computer_use_user_gate(tool_name, input).is_some()
 }
 
-/// Repo-law `ask` rules require a human decision. Only Ask and Accept Edits
-/// can open that decision; every autonomous or no-prompt posture must fail
-/// closed.
+/// Repo-law `ask` rules require a human decision. Ask, Accept Edits, and
+/// interactive Auto-Review with an attached owner can open that decision;
+/// every autonomous or unattended posture fails closed.
 pub(super) fn repo_law_must_block_without_prompt(
     approval_mode: ApprovalMode,
     auto_approve: bool,
+    owner_present: bool,
 ) -> bool {
-    auto_approve || !approval_mode.is_ask_family()
+    auto_approve
+        || !(approval_mode.is_ask_family()
+            || (approval_mode == ApprovalMode::Auto && owner_present))
 }
 
 pub(super) fn requested_sandbox_escalation(
@@ -2279,13 +2282,40 @@ impl Engine {
                 )));
             }
 
-            // #3026: a hook `ask` decision forces the approval prompt even
-            // for tools the registry would auto-run. Must stay after the
-            // registry-based computation above, which assigns rather than
-            // ORs `approval_required`.
+            let owner_can_prompt = self.current_turn_authority().owner_present()
+                && !detached_start
+                && self
+                    .child_host
+                    .as_ref()
+                    .is_none_or(|child| child.authority.runtime.parent_can_prompt);
+
+            if blocked_error.is_none()
+                && batch_approval_mode == ApprovalMode::Auto
+                && approval_force_prompt
+                && !owner_can_prompt
+                && crate::tools::approval_cache::computer_use_user_gate(&tool_name, &tool_input)
+                    .is_none()
+            {
+                approval_required = false;
+                approval_force_prompt = false;
+                blocked_error = Some(ToolError::permission_denied(format!(
+                    "Tool '{tool_name}' requires user confirmation in Auto-Review, and there is no interactive owner surface to ask."
+                )));
+            }
+
             if hook_requires_approval && !self.session.auto_approve {
-                approval_required = true;
-                approval_force_prompt = true;
+                if batch_approval_mode == ApprovalMode::Auto && !owner_can_prompt {
+                    approval_required = false;
+                    approval_force_prompt = false;
+                    if blocked_error.is_none() {
+                        blocked_error = Some(ToolError::permission_denied(format!(
+                            "Tool '{tool_name}' blocked in Auto-Review: tool_call_before hook requires approval, and there is no interactive owner surface to ask."
+                        )));
+                    }
+                } else {
+                    approval_required = true;
+                    approval_force_prompt = true;
+                }
             }
 
             if blocked_error.is_none() {
@@ -2323,9 +2353,15 @@ impl Engine {
                             // (auto_approve). A typed deny rule still blocks
                             // hard, in every mode.
                             if !self.session.auto_approve {
-                                approval_required = true;
-                                approval_description = reason;
-                                approval_force_prompt = true;
+                                if batch_approval_mode == ApprovalMode::Auto && !owner_can_prompt {
+                                    approval_required = false;
+                                    approval_force_prompt = false;
+                                    blocked_error = Some(ToolError::permission_denied(reason));
+                                } else {
+                                    approval_required = true;
+                                    approval_description = reason;
+                                    approval_force_prompt = true;
+                                }
                             }
                         }
                         ToolAskRuleDecision::Block(reason) => {
@@ -2336,6 +2372,31 @@ impl Engine {
                     }
                 }
             }
+
+            let repo_law_decision = if blocked_error.is_none() {
+                crate::repo_law::repo_law_plan_decision(
+                    &self.session.workspace,
+                    &tool_name,
+                    &tool_input,
+                )
+            } else {
+                None
+            };
+            let repo_law_blocks_now = matches!(
+                repo_law_decision,
+                Some(crate::repo_law::RepoLawPlanDecision::Block(_))
+            ) || (matches!(
+                repo_law_decision,
+                Some(crate::repo_law::RepoLawPlanDecision::ForcePrompt(_))
+            ) && repo_law_must_block_without_prompt(
+                batch_approval_mode,
+                self.session.auto_approve,
+                owner_can_prompt,
+            ));
+            let repo_law_forces_prompt = matches!(
+                repo_law_decision,
+                Some(crate::repo_law::RepoLawPlanDecision::ForcePrompt(_))
+            ) && !repo_law_blocks_now;
 
             if blocked_error.is_none() {
                 let review_context =
@@ -2361,6 +2422,29 @@ impl Engine {
                             "auto_review": audit_event,
                         }))
                         .await;
+                        let extension_forces_prompt = source == ToolCallSource::Extension
+                            && matches!(
+                                crate::extension_host::core_call::origin_approval(
+                                    &tool_name,
+                                    &tool_input,
+                                    approval_required,
+                                    tool_registry
+                                        .and_then(|registry| registry.get(&tool_name))
+                                        .as_deref(),
+                                ),
+                                crate::extension_host::core_call::OriginApproval::ForcePrompt
+                            );
+                        let forced_human_prompt = approval_force_prompt
+                            || crate::tools::approval_cache::computer_use_user_gate(
+                                &tool_name,
+                                &tool_input,
+                            )
+                            .is_some()
+                            || extension_forces_prompt;
+                        let hard_auto_review_block = audit_event
+                            .get("decision")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("block");
                         match decision {
                             AutoReviewPlanDecision::NoChange => {}
                             AutoReviewPlanDecision::Allow => {
@@ -2368,7 +2452,10 @@ impl Engine {
                                     approval_required = false;
                                 }
                             }
-                            AutoReviewPlanDecision::ForcePrompt(reason) => {
+                            AutoReviewPlanDecision::ForcePrompt(reason)
+                                if batch_approval_mode != ApprovalMode::Auto
+                                    || owner_can_prompt =>
+                            {
                                 // The built-in safety floor holds outside Full
                                 // Access. Ask surfaces the hold as a real
                                 // decision; the non-interactive postures turn
@@ -2377,7 +2464,20 @@ impl Engine {
                                 approval_description = reason;
                                 approval_force_prompt = true;
                             }
-                            AutoReviewPlanDecision::Block(reason) => {
+                            AutoReviewPlanDecision::Block(reason)
+                                if batch_approval_mode == ApprovalMode::Auto
+                                    && owner_can_prompt
+                                    && forced_human_prompt
+                                    && !hard_auto_review_block =>
+                            {
+                                approval_required = true;
+                                approval_force_prompt = true;
+                                if approval_description == "Tool execution requires approval" {
+                                    approval_description = reason;
+                                }
+                            }
+                            AutoReviewPlanDecision::ForcePrompt(reason)
+                            | AutoReviewPlanDecision::Block(reason) => {
                                 approval_required = false;
                                 approval_force_prompt = false;
                                 let _ = self
@@ -2402,6 +2502,19 @@ impl Engine {
                                 )));
                                 approval_required = false;
                                 approval_force_prompt = false;
+                            }
+                            AutoReviewPlanDecision::ConsultReviewer(_)
+                                if batch_approval_mode == ApprovalMode::Auto
+                                    && (forced_human_prompt
+                                        || repo_law_forces_prompt
+                                        || repo_law_blocks_now) =>
+                            {
+                                if owner_can_prompt
+                                    && (forced_human_prompt || repo_law_forces_prompt)
+                                {
+                                    approval_required = true;
+                                    approval_force_prompt = true;
+                                }
                             }
                             AutoReviewPlanDecision::ConsultReviewer(held_reason) => {
                                 if let Err(error) = self
@@ -2430,11 +2543,7 @@ impl Engine {
             // bypassable by mode — it can only add holds, never remove
             // one, so this cannot weaken any gate above.
             if blocked_error.is_none()
-                && let Some(decision) = crate::repo_law::repo_law_plan_decision(
-                    &self.session.workspace,
-                    &tool_name,
-                    &tool_input,
-                )
+                && let Some(decision) = repo_law_decision
             {
                 emit_tool_audit(json!({
                     "event": "tool.repo_law_decision",
@@ -2452,14 +2561,15 @@ impl Engine {
                 match decision {
                     crate::repo_law::RepoLawPlanDecision::ForcePrompt(reason) => {
                         if repo_law_must_block_without_prompt(
-                            self.session.approval_mode,
+                            batch_approval_mode,
                             self.session.auto_approve,
+                            owner_can_prompt,
                         ) {
                             approval_required = false;
                             approval_force_prompt = false;
                             blocked_error = Some(ToolError::permission_denied(format!(
                                 "Repository law blocked tool '{tool_name}' in {}: {reason}. Switch to Ask to review this protected change.",
-                                self.session.approval_mode.permission_chip_label(),
+                                batch_approval_mode.permission_chip_label(),
                             )));
                         } else {
                             approval_required = true;
@@ -2565,8 +2675,6 @@ impl Engine {
 
             // Consent is an exact human decision, never a standing grant or
             // autonomous approval. Keep existing hard blocks authoritative.
-            // Ask and Full Access both have a person at the card; Auto-Review
-            // and Never do not, and keep failing closed.
             if blocked_error.is_none()
                 && crate::tools::approval_cache::computer_use_user_gate(&tool_name, &tool_input)
                     .is_some()
@@ -2574,7 +2682,8 @@ impl Engine {
                 if matches!(
                     batch_approval_mode,
                     ApprovalMode::Suggest | ApprovalMode::AcceptEdits | ApprovalMode::Bypass
-                ) {
+                ) || (batch_approval_mode == ApprovalMode::Auto && owner_can_prompt)
+                {
                     approval_required = true;
                     approval_force_prompt = true;
                 } else {
@@ -2628,8 +2737,16 @@ impl Engine {
                         approval_required = true;
                     }
                     crate::extension_host::core_call::OriginApproval::ForcePrompt => {
-                        approval_required = true;
-                        approval_force_prompt = true;
+                        if batch_approval_mode == ApprovalMode::Auto && !owner_can_prompt {
+                            approval_required = false;
+                            approval_force_prompt = false;
+                            blocked_error = Some(ToolError::permission_denied(format!(
+                                "Extension call '{tool_name}' requires user confirmation in Auto-Review, and there is no interactive owner surface to ask."
+                            )));
+                        } else {
+                            approval_required = true;
+                            approval_force_prompt = true;
+                        }
                     }
                 }
             }

@@ -1896,7 +1896,8 @@ async fn the_client_connects_only_to_the_pinned_address() {
 fn the_first_send_card_cannot_be_skipped_by_a_grant_or_a_posture() {
     use super::super::core_call::{OriginApproval, origin_approval, refusal};
     use crate::core::authority::{
-        ApprovalRequestDisposition as D, TurnAuthority, resolve_approval_request_disposition,
+        ApprovalRequestDisposition as D, RunOrigin, TurnAuthority,
+        resolve_approval_request_disposition,
     };
     use codewhale_config::AppMode;
 
@@ -1910,24 +1911,30 @@ fn the_first_send_card_cannot_be_skipped_by_a_grant_or_a_posture() {
         refusal(std::slice::from_ref(&spec), SEND_TOOL, &input),
         None
     );
-    let posture = |auto_approve: bool, mode: ApprovalMode, granted: bool| {
-        resolve_approval_request_disposition(
-            &TurnAuthority::from_effective_fields(AppMode::Agent, true, false, auto_approve, mode),
-            granted,
-            false,
-            true,
-            true,
-        )
+    let posture = |auto_approve: bool, mode: ApprovalMode, granted: bool, owner_present: bool| {
+        let mut authority =
+            TurnAuthority::from_effective_fields(AppMode::Agent, true, false, auto_approve, mode);
+        if owner_present {
+            authority = authority.with_rust_origin(RunOrigin::Interactive, true);
+        }
+        resolve_approval_request_disposition(&authority, granted, false, true, true)
     };
     for granted in [false, true] {
-        assert_eq!(posture(false, ApprovalMode::Suggest, granted), D::Prompt);
-        assert_eq!(posture(true, ApprovalMode::Bypass, granted), D::Prompt);
         assert_eq!(
-            posture(false, ApprovalMode::Auto, granted),
+            posture(false, ApprovalMode::Suggest, granted, true),
+            D::Prompt
+        );
+        assert_eq!(
+            posture(true, ApprovalMode::Bypass, granted, true),
+            D::Prompt
+        );
+        assert_eq!(posture(false, ApprovalMode::Auto, granted, true), D::Prompt);
+        assert_eq!(
+            posture(false, ApprovalMode::Auto, granted, false),
             D::AutoDenyAutoReview
         );
         assert_eq!(
-            posture(false, ApprovalMode::Never, granted),
+            posture(false, ApprovalMode::Never, granted, true),
             D::AutoDenyNeverPosture
         );
     }

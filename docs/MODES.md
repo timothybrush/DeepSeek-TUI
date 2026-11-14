@@ -275,9 +275,17 @@ Legacy note: `/set approval_mode ...` was retired in favor of `/config`.
   Headless `exec` turns consult the model guardian for fallback non-destructive
   holds while applying the deterministic unattended rules to destructive work;
   ACP turns use deterministic rules only and refuse guardian consultation.
-  Unattended and headless runs never open an approval card, and repo-law holds
-  that explicitly require a person block in Auto-Review rather than opening a
-  hidden approval modal.
+  When `owner_present` is true (an interactive TUI or owner runtime surface
+  turn), forced prompts — typed `permissions.toml` `ask` rules, `tool_call_before`
+  hook `ask`, prompt-only tools such as Computer Use consent and script cards,
+  repo-law holds that require a person, and forced extension calls — open the
+  normal approval card instead of being waived or failing closed, unless a hard
+  block (`hidden_unicode` or a configured `auto_review.block` rule) applies; on
+  runtime threads, only the owner's surface (`desktop`, `tui`, or `web`) may
+  answer such a card. When `owner_present` is false (`Background`, `Headless`,
+  or unattached turns), unattended and headless runs never open an approval card,
+  refuse forced prompts naming the rule without registering a pending approval,
+  and block repo-law holds that require a person.
 
 The LLM reviewer is closest to OpenAI Codex's experimental Auto-Review at
 commit [`6fc6b9d6d2580d62622fc9884b5f5707f6505a5e`](https://github.com/openai/codex/tree/6fc6b9d6d2580d62622fc9884b5f5707f6505a5e).

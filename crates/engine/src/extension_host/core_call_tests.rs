@@ -1706,6 +1706,7 @@ fn action_families_and_registered_process_or_network_tools_always_force_a_prompt
 /// auto-approves ordinary extension calls as it does for the model.
 #[test]
 fn extension_calls_resolve_against_every_posture_as_documented() {
+    use crate::core::authority::RunOrigin;
     use crate::core::authority::{
         ApprovalRequestDisposition as D, TurnAuthority, resolve_approval_request_disposition,
     };
@@ -1716,10 +1717,11 @@ fn extension_calls_resolve_against_every_posture_as_documented() {
         TurnAuthority::from_effective_fields(AppMode::Agent, true, false, auto_approve, mode)
     };
     let input = json!({});
-    // (posture, session grant held for exactly this extension's call)
     let ask = authority(false, ApprovalMode::Suggest);
     let full = authority(true, ApprovalMode::Bypass);
     let auto_review = authority(false, ApprovalMode::Auto);
+    let auto_review_interactive =
+        authority(false, ApprovalMode::Auto).with_rust_origin(RunOrigin::Interactive, true);
     let never = authority(false, ApprovalMode::Never);
 
     let resolve = |authority: &TurnAuthority, name: &str, granted: bool| {
@@ -1735,11 +1737,9 @@ fn extension_calls_resolve_against_every_posture_as_documented() {
         }
     };
 
-    // A read-only workspace tool: no request at all, in any posture.
-    for authority in [&ask, &full, &auto_review, &never] {
+    for authority in [&ask, &full, &auto_review, &auto_review_interactive, &never] {
         assert_eq!(resolve(authority, "read_file", false), None);
     }
-    // An ordinary tool that needs approval ("write_file").
     assert_eq!(resolve(&ask, "write_file", false), Some(D::Prompt));
     assert_eq!(
         resolve(&ask, "write_file", true),
@@ -1752,11 +1752,13 @@ fn extension_calls_resolve_against_every_posture_as_documented() {
         Some(D::AutoDenyAutoReview)
     );
     assert_eq!(
+        resolve(&auto_review_interactive, "write_file", false),
+        Some(D::AutoDenyAutoReview)
+    );
+    assert_eq!(
         resolve(&never, "write_file", true),
         Some(D::AutoDenyNeverPosture)
     );
-    // Shell and network ask in Ask and Full Access, whatever grant exists.
-    // Explicit no-prompt postures still refuse.
     for name in ["bash", "web_search"] {
         assert_eq!(resolve(&ask, name, false), Some(D::Prompt), "{name}");
         assert_eq!(
@@ -1767,9 +1769,19 @@ fn extension_calls_resolve_against_every_posture_as_documented() {
         assert_eq!(resolve(&full, name, false), Some(D::Prompt), "{name}");
         assert_eq!(resolve(&full, name, true), Some(D::Prompt), "{name}");
         assert_eq!(
+            resolve(&auto_review_interactive, name, false),
+            Some(D::Prompt),
+            "{name}: interactive Auto-Review"
+        );
+        assert_eq!(
+            resolve(&auto_review_interactive, name, true),
+            Some(D::Prompt),
+            "{name}: grant never skips forced prompt in interactive Auto-Review"
+        );
+        assert_eq!(
             resolve(&auto_review, name, false),
             Some(D::AutoDenyAutoReview),
-            "{name}"
+            "{name}: unattended Auto-Review"
         );
         assert_eq!(
             resolve(&never, name, true),

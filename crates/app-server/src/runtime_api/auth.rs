@@ -81,12 +81,21 @@ pub(super) async fn require_host_token(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RuntimeAuthCaller {
+    MasterOrLocal,
+    DeviceClient,
+    WebSession,
+    MobileSession,
+}
+
 pub(super) async fn require_runtime_token(
     State(state): State<RuntimeApiState>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Response {
-    if runtime_request_is_authorized(&req, &state) {
+    if let Some(caller) = resolve_runtime_auth_caller(&req, &state) {
+        req.extensions_mut().insert(caller);
         next.run(req).await
     } else if request_bearer(&req)
         .is_some_and(|token| state.computer.client_principal(token).is_some())
@@ -102,31 +111,64 @@ pub(super) async fn require_runtime_token(
 }
 
 pub(super) fn runtime_request_is_authorized(req: &Request, state: &RuntimeApiState) -> bool {
-    let Some(expected) = state.runtime_token.as_deref() else {
-        return true;
-    };
-    if request_has_header_runtime_token(req, expected) {
-        return true;
+    resolve_runtime_auth_caller(req, state).is_some()
+}
+
+pub(super) fn resolve_runtime_auth_caller(
+    req: &Request,
+    state: &RuntimeApiState,
+) -> Option<RuntimeAuthCaller> {
+    if let Some(expected) = state.runtime_token.as_deref() {
+        if request_has_header_runtime_token(req, expected) {
+            return Some(RuntimeAuthCaller::MasterOrLocal);
+        }
+        // Device tokens carry their immutable mint intent. Watch permits HTTP
+        // reads only; an upgraded GET could otherwise become a write channel.
+        // Computer display/control routes enforce intent in their own handlers.
+        if let Some(principal) =
+            request_bearer(req).and_then(|token| state.computer.client_principal(token))
+        {
+            return client_request_is_authorized(&principal, req)
+                .then_some(RuntimeAuthCaller::DeviceClient);
+        }
+        if state
+            .web
+            .as_ref()
+            .is_some_and(|web| web_session_request_is_authorized(req, state, web))
+        {
+            return Some(RuntimeAuthCaller::WebSession);
+        }
+        if state
+            .mobile
+            .as_ref()
+            .is_some_and(|mobile| mobile_session_request_is_authorized(req, state, mobile))
+        {
+            return Some(RuntimeAuthCaller::MobileSession);
+        }
+        None
+    } else {
+        if let Some(principal) =
+            request_bearer(req).and_then(|token| state.computer.client_principal(token))
+        {
+            return client_request_is_authorized(&principal, req)
+                .then_some(RuntimeAuthCaller::DeviceClient);
+        }
+        if state
+            .web
+            .as_ref()
+            .is_some_and(|web| web_session_request_is_authorized(req, state, web))
+        {
+            return Some(RuntimeAuthCaller::WebSession);
+        }
+        if state
+            .mobile
+            .as_ref()
+            .is_some_and(|mobile| mobile_session_request_is_authorized(req, state, mobile))
+        {
+            return Some(RuntimeAuthCaller::MobileSession);
+        }
+        Some(RuntimeAuthCaller::MasterOrLocal)
     }
-    // Device tokens carry their immutable mint intent. Watch permits HTTP
-    // reads only; an upgraded GET could otherwise become a write channel.
-    // Computer display/control routes enforce intent in their own handlers.
-    if let Some(principal) =
-        request_bearer(req).and_then(|token| state.computer.client_principal(token))
-    {
-        return client_request_is_authorized(&principal, req);
-    }
-    if state
-        .web
-        .as_ref()
-        .is_some_and(|web| web_session_request_is_authorized(req, state, web))
-    {
-        return true;
-    }
-    state
-        .mobile
-        .as_ref()
-        .is_some_and(|mobile| mobile_session_request_is_authorized(req, state, mobile))
 }
 
 fn client_request_is_authorized(

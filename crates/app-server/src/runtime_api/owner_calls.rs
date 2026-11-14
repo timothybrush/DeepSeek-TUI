@@ -201,7 +201,7 @@ async fn execute_ordinary(state: RuntimeApiState, request: RuntimeOwnerRequest) 
                 approval_id,
                 binding.as_ref(),
                 decision,
-                None,
+                Some(codewhale_engine::runtime_threads::manager::ApprovalResponder::Desktop),
             )
             .await)?;
             serde_json::to_value(value)?
@@ -493,7 +493,7 @@ async fn execute_native(
                     params.approval_id,
                     Some(&binding),
                     decision,
-                    None,
+                    Some(codewhale_engine::runtime_threads::manager::ApprovalResponder::Desktop),
                     Some(&selected),
                 )
                 .await,

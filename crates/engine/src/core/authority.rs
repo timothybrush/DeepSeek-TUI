@@ -721,8 +721,9 @@ pub enum ApprovalRequestDisposition {
     /// A forced (non-bypassable) policy hold arrived under a full-access
     /// posture that opens no modal: fail closed.
     AutoDenyFullAccessPolicyHold,
-    /// Auto-Review is autonomous: unresolved holds fail closed instead of
-    /// opening a user-approval modal.
+    /// Auto-Review runs autonomously when no owner surface is present or no
+    /// forced prompt requires the person: unresolved non-forced holds fail
+    /// closed instead of opening a user-approval modal.
     AutoDenyAutoReview,
     /// approval_mode=Never: deny without a modal.
     AutoDenyNeverPosture,
@@ -734,12 +735,14 @@ pub enum ApprovalRequestDisposition {
 ///
 /// `session_approved` / `session_denied` are the caller's lookups into the
 /// session approval caches (grouping key or tool name / exact approval key).
-/// The branch order: session denial, then the Auto-Review hold, then the
-/// full-access policy-hold denial, then the `Never` denial — the live posture
-/// wins over any remembered grant (approvals J) — then auto-approval (full
-/// access or a session grant), and only finally a modal. Extension-origin
-/// forced calls reach that modal even under Full Access; no remembered grant
-/// can satisfy them. `extension_origin` comes from Rust-minted approval keys,
+/// The branch order: session denial, then Auto-Review (which prompts only when
+/// `approval_force_prompt && authority.owner_present()`, and otherwise fails
+/// closed), then the full-access policy-hold denial, then the `Never` denial —
+/// the live posture wins over any remembered grant (approvals J) — then
+/// auto-approval (full access or a session grant), and only finally a modal.
+/// Extension-origin forced calls reach that modal under Full Access and
+/// interactive Auto-Review with the owner present; no remembered grant can
+/// satisfy them. `extension_origin` comes from Rust-minted approval keys,
 /// never an extension label or a claim supplied by the host.
 #[must_use]
 pub fn resolve_approval_request_disposition(
@@ -753,7 +756,11 @@ pub fn resolve_approval_request_disposition(
         return ApprovalRequestDisposition::AutoDenySessionDenied;
     }
     if authority.approval_mode_for_session() == ApprovalMode::Auto {
-        return ApprovalRequestDisposition::AutoDenyAutoReview;
+        return if approval_force_prompt && authority.owner_present() {
+            ApprovalRequestDisposition::Prompt
+        } else {
+            ApprovalRequestDisposition::AutoDenyAutoReview
+        };
     }
     // The request exists, so the engine already resolved Prompt for the tool
     // itself. What remains is the posture question: how does this authority
@@ -1464,6 +1471,133 @@ mod tests {
         assert_eq!(
             resolve_approval_request_disposition(&ask, false, false, false, false),
             ApprovalRequestDisposition::Prompt
+        );
+    }
+
+    #[test]
+    fn auto_review_forced_prompts_require_owner_presence_and_preserve_other_modes() {
+        let ask = TurnAuthority::for_tui_surface(
+            AppMode::Agent,
+            false,
+            false,
+            false,
+            ApprovalMode::Suggest,
+        );
+        let accept_edits = TurnAuthority::for_tui_surface(
+            AppMode::Agent,
+            false,
+            false,
+            false,
+            ApprovalMode::AcceptEdits,
+        );
+        let plan =
+            TurnAuthority::for_tui_surface(AppMode::Plan, false, false, false, ApprovalMode::Auto);
+        let full_access = TurnAuthority::for_tui_surface(
+            AppMode::Agent,
+            false,
+            false,
+            true,
+            ApprovalMode::Bypass,
+        );
+        let never = TurnAuthority::for_tui_surface(
+            AppMode::Agent,
+            false,
+            false,
+            false,
+            ApprovalMode::Never,
+        );
+
+        let auto_interactive =
+            TurnAuthority::for_tui_surface(AppMode::Agent, false, false, false, ApprovalMode::Auto);
+        let auto_attached = authority(AppMode::Agent, false, ApprovalMode::Auto)
+            .with_rust_origin(RunOrigin::Interactive, true);
+        let auto_background = authority(AppMode::Agent, false, ApprovalMode::Auto)
+            .with_rust_origin(RunOrigin::Background, false);
+        let auto_headless = authority(AppMode::Agent, false, ApprovalMode::Auto);
+        let auto_interactive_unattached = authority(AppMode::Agent, false, ApprovalMode::Auto)
+            .with_rust_origin(RunOrigin::Interactive, false);
+
+        for owner_present in [&auto_interactive, &auto_attached] {
+            for is_extension in [false, true] {
+                for session_approved in [false, true] {
+                    assert_eq!(
+                        resolve_approval_request_disposition(
+                            owner_present,
+                            session_approved,
+                            false,
+                            true,
+                            is_extension,
+                        ),
+                        ApprovalRequestDisposition::Prompt
+                    );
+                    assert_eq!(
+                        resolve_approval_request_disposition(
+                            owner_present,
+                            session_approved,
+                            true,
+                            true,
+                            is_extension,
+                        ),
+                        ApprovalRequestDisposition::AutoDenySessionDenied
+                    );
+                }
+                assert_eq!(
+                    resolve_approval_request_disposition(
+                        owner_present,
+                        false,
+                        false,
+                        false,
+                        is_extension,
+                    ),
+                    ApprovalRequestDisposition::AutoDenyAutoReview
+                );
+            }
+        }
+
+        for owner_absent in [
+            &auto_background,
+            &auto_headless,
+            &auto_interactive_unattached,
+        ] {
+            for is_extension in [false, true] {
+                for force_prompt in [false, true] {
+                    assert_eq!(
+                        resolve_approval_request_disposition(
+                            owner_absent,
+                            false,
+                            false,
+                            force_prompt,
+                            is_extension,
+                        ),
+                        ApprovalRequestDisposition::AutoDenyAutoReview
+                    );
+                }
+            }
+        }
+
+        assert_eq!(
+            resolve_approval_request_disposition(&ask, false, false, true, false),
+            ApprovalRequestDisposition::Prompt
+        );
+        assert_eq!(
+            resolve_approval_request_disposition(&accept_edits, false, false, true, false),
+            ApprovalRequestDisposition::Prompt
+        );
+        assert_eq!(
+            resolve_approval_request_disposition(&plan, false, false, true, false),
+            ApprovalRequestDisposition::Prompt
+        );
+        assert_eq!(
+            resolve_approval_request_disposition(&full_access, false, false, true, false),
+            ApprovalRequestDisposition::AutoDenyFullAccessPolicyHold
+        );
+        assert_eq!(
+            resolve_approval_request_disposition(&full_access, false, false, true, true),
+            ApprovalRequestDisposition::Prompt
+        );
+        assert_eq!(
+            resolve_approval_request_disposition(&never, false, false, true, false),
+            ApprovalRequestDisposition::AutoDenyNeverPosture
         );
     }
 

@@ -648,6 +648,7 @@ pub struct ToolExecutionState {
     /// inherits the authority the caller was granted rather than re-deriving
     /// one from a legacy bit.
     pub approval_mode: ApprovalMode,
+    pub owner_present: bool,
     /// Effective shell policy for this execution context.
     pub shell_policy: ShellPolicy,
     /// Effective feature flag set for the running session.
@@ -817,6 +818,7 @@ impl ToolContext {
                 shell_network_denied_hint: None,
                 auto_approve: false,
                 approval_mode: ApprovalMode::Suggest,
+                owner_present: false,
                 shell_policy,
                 features: Features::with_defaults(),
                 state_namespace: "workspace".to_string(),

@@ -1450,6 +1450,7 @@ fn project_turn_authority(
     context.trust_mode = authority.trust_mode;
     context.auto_approve = authority.auto_approve;
     context.approval_mode = authority.approval_mode;
+    context.owner_present = authority.owner_present();
     context.set_shell_policy(authority.shell_policy());
     context.elevated_sandbox_policy =
         Some(authority.sandbox_policy(workspace, configured_sandbox_mode, network_access));

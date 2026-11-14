@@ -7026,9 +7026,12 @@ async fn list_approvals(
 
 async fn decide_approval(
     State(state): State<RuntimeApiState>,
+    axum::Extension(auth_caller): axum::Extension<auth::RuntimeAuthCaller>,
     Path(approval_id): Path<String>,
     Json(req): Json<DecideApprovalBody>,
 ) -> Result<Json<DecideApprovalResponse>, ApiError> {
+    use codewhale_engine::runtime_threads::manager::ApprovalResponder;
+
     let decision = match req.decision.as_str() {
         "allow" => ExternalApprovalDecision::Allow {
             remember: req.remember,
@@ -7042,8 +7045,38 @@ async fn decide_approval(
             )));
         }
     };
+    let responder = match auth_caller {
+        auth::RuntimeAuthCaller::MasterOrLocal => req.client,
+        auth::RuntimeAuthCaller::WebSession => match req.client {
+            None | Some(ApprovalResponder::Web) => Some(ApprovalResponder::Web),
+            Some(_) => {
+                return Err(
+                    ApiError::forbidden("web session cannot claim another client surface")
+                        .with_code("owner_required"),
+                );
+            }
+        },
+        auth::RuntimeAuthCaller::MobileSession => {
+            if req.client.is_some_and(ApprovalResponder::is_owner_surface) {
+                return Err(
+                    ApiError::forbidden("only the owner surface may answer this approval")
+                        .with_code("owner_required"),
+                );
+            }
+            Some(ApprovalResponder::Phone)
+        }
+        auth::RuntimeAuthCaller::DeviceClient => {
+            if req.client.is_some_and(ApprovalResponder::is_owner_surface) {
+                return Err(
+                    ApiError::forbidden("only the owner surface may answer this approval")
+                        .with_code("owner_required"),
+                );
+            }
+            req.client
+        }
+    };
     Ok(Json(
-        settle_approval_request(&state, approval_id, None, decision, req.client).await?,
+        settle_approval_request(&state, approval_id, None, decision, responder).await?,
     ))
 }
 
@@ -7083,6 +7116,10 @@ async fn settle_approval_request_in_workspace(
                 .is::<codewhale_engine::runtime_threads::manager::ApprovalBindingMismatch>()
             {
                 ApiError::forbidden(error.to_string())
+            } else if error
+                .is::<codewhale_engine::runtime_threads::manager::ApprovalOwnerRequired>()
+            {
+                ApiError::forbidden(error.to_string()).with_code("owner_required")
             } else if error
                 .downcast_ref::<std::io::Error>()
                 .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists)

@@ -1136,6 +1136,7 @@ async fn spawn_test_server_with_root_token_mobile_workspace(
 
 #[derive(Default)]
 struct TestServerOverrides {
+    owner_host: bool,
     state_handle: Option<oneshot::Sender<RuntimeApiState>>,
     automation_handles: Option<
         oneshot::Sender<(
@@ -1426,16 +1427,33 @@ async fn build_test_server(
         sessions_dir: Some(sessions_dir.clone()),
         max_active_threads: overrides.max_active_threads.unwrap_or(8),
     };
-    let runtime_threads: SharedRuntimeThreadManager =
-        Arc::new(match overrides.plugin_discovery.as_ref() {
-            Some(discovery) => RuntimeThreadManager::open_with_plugin_registry(
+    let runtime_threads: SharedRuntimeThreadManager = Arc::new(
+        match (overrides.owner_host, overrides.plugin_discovery.as_ref()) {
+            (true, discovery) => {
+                let plugins = match discovery {
+                    Some(discovery) => discovery.registry_for_workspace(&workspace),
+                    None => Arc::new(codewhale_plugins::PluginRegistry::empty(&workspace)),
+                };
+                RuntimeThreadManager::open_owner_host(
+                    config.clone(),
+                    workspace.clone(),
+                    manager_config,
+                    plugins,
+                    None,
+                    None,
+                )?
+            }
+            (false, Some(discovery)) => RuntimeThreadManager::open_with_plugin_registry(
                 config.clone(),
                 workspace.clone(),
                 manager_config,
                 discovery.registry_for_workspace(&workspace),
             )?,
-            None => RuntimeThreadManager::open(config.clone(), workspace.clone(), manager_config)?,
-        });
+            (false, None) => {
+                RuntimeThreadManager::open(config.clone(), workspace.clone(), manager_config)?
+            }
+        },
+    );
     let sessions_dir = runtime_threads.sessions_dir().to_path_buf();
     runtime_threads.attach_task_manager(manager.clone());
     let automations = Arc::new(Mutex::new(AutomationManager::open_for_test(
@@ -11583,6 +11601,208 @@ async fn mobile_page_serves_shell_when_auth_enabled() -> Result<()> {
         .await?
         .error_for_status()?;
     assert!(bearer.text().await?.contains("Codewhale Mobile"));
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn auto_review_forced_approval_rejects_non_owner_clients_on_http_api() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path().to_path_buf();
+    let sessions_dir = root.join("sessions");
+    let workspace = root.join("workspace");
+    let token = "owner-only-runtime-test-token".to_string();
+    let (web_state, web_nonce) = web::RuntimeWebState::new();
+    let (mobile_state, mobile_nonce) = mobile::RuntimeMobileState::new();
+    let Some((addr, runtime_threads, handle)) =
+        spawn_test_server_with_root_token_mobile_workspace_and_overrides(
+            root,
+            sessions_dir,
+            Some(token.clone()),
+            true,
+            workspace,
+            TestServerOverrides {
+                owner_host: true,
+                web: Some(web_state),
+                mobile: Some(mobile_state),
+                ..TestServerOverrides::default()
+            },
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    assert!(runtime_threads.is_owner_surface_attached_for_test());
+    let origin = format!("http://{addr}");
+    let client = codewhale_release::tls::reqwest_client_builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+
+    let drive_token_resp: Value = client
+        .post(format!("{origin}/v1/auth/client-tokens"))
+        .bearer_auth(&token)
+        .json(&json!({
+            "device_id": "paired-drive-device",
+            "intent": "drive"
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let drive_token = drive_token_resp["token"]
+        .as_str()
+        .context("drive token")?
+        .to_string();
+
+    let web_exchange = client
+        .get(format!("{origin}/__codewhale/bootstrap/{web_nonce}"))
+        .send()
+        .await?;
+    assert_eq!(web_exchange.status(), StatusCode::SEE_OTHER);
+    let web_proof = web_exchange
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|loc| loc.strip_prefix("/#p="))
+        .context("web proof")?
+        .to_string();
+    let web_cookie = web_exchange
+        .headers()
+        .get(header::SET_COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(';').next())
+        .context("web cookie")?
+        .to_string();
+
+    let mobile_exchange = client
+        .get(format!(
+            "{origin}/__codewhale/mobile/bootstrap/{mobile_nonce}"
+        ))
+        .send()
+        .await?;
+    assert_eq!(mobile_exchange.status(), StatusCode::SEE_OTHER);
+    let mobile_fragment = mobile_exchange
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|loc| loc.strip_prefix("/mobile#"))
+        .context("mobile fragment")?;
+    let mobile_proof = mobile_fragment
+        .split('&')
+        .find_map(|p| p.strip_prefix("request_proof="))
+        .context("mobile proof")?
+        .to_string();
+    let mobile_cookie = mobile_exchange
+        .headers()
+        .get(header::SET_COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(';').next())
+        .context("mobile cookie")?
+        .to_string();
+
+    let created: Value = client
+        .post(format!("{origin}/v1/threads"))
+        .bearer_auth(&token)
+        .json(&json!({}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let thread_id = created["id"].as_str().context("thread id")?.to_string();
+
+    let (approval_id_1, rx_1) = runtime_threads
+        .register_owner_only_pending_approval_for_thread_for_test(&thread_id, "owner-card-1");
+
+    let assert_owner_required = |resp: reqwest::Response| async {
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body: Value = resp.json().await?;
+        assert_eq!(body["error"]["code"], "owner_required", "{body:#}");
+        Result::<()>::Ok(())
+    };
+
+    assert_owner_required(
+        client
+            .post(format!("{origin}/v1/approvals/{approval_id_1}"))
+            .bearer_auth(&drive_token)
+            .json(&json!({ "decision": "allow", "client": "desktop" }))
+            .send()
+            .await?,
+    )
+    .await?;
+
+    for mobile_client in ["desktop", "phone"] {
+        assert_owner_required(
+            client
+                .post(format!("{origin}/v1/approvals/{approval_id_1}"))
+                .header(header::COOKIE, &mobile_cookie)
+                .header(mobile::MOBILE_REQUEST_HEADER, &mobile_proof)
+                .header(header::ORIGIN, &origin)
+                .header("sec-fetch-site", "same-origin")
+                .json(&json!({ "decision": "allow", "client": mobile_client }))
+                .send()
+                .await?,
+        )
+        .await?;
+    }
+
+    assert_owner_required(
+        client
+            .post(format!("{origin}/v1/approvals/{approval_id_1}"))
+            .bearer_auth(&token)
+            .json(&json!({ "decision": "allow" }))
+            .send()
+            .await?,
+    )
+    .await?;
+
+    for non_owner_client in ["phone", "acp"] {
+        assert_owner_required(
+            client
+                .post(format!("{origin}/v1/approvals/{approval_id_1}"))
+                .bearer_auth(&token)
+                .json(&json!({ "decision": "allow", "client": non_owner_client }))
+                .send()
+                .await?,
+        )
+        .await?;
+    }
+    assert_eq!(runtime_threads.pending_approvals_count(), 1);
+
+    let web_ok = client
+        .post(format!("{origin}/v1/approvals/{approval_id_1}"))
+        .header(header::COOKIE, &web_cookie)
+        .header(web::WEB_REQUEST_HEADER, &web_proof)
+        .header(header::ORIGIN, &origin)
+        .header("sec-fetch-site", "same-origin")
+        .json(&json!({ "decision": "allow" }))
+        .send()
+        .await?;
+    assert_eq!(web_ok.status(), StatusCode::OK);
+    assert_eq!(
+        rx_1.await?,
+        codewhale_engine::runtime_threads::manager::ExternalApprovalDecision::Allow {
+            remember: false
+        }
+    );
+
+    let (approval_id_2, rx_2) = runtime_threads
+        .register_owner_only_pending_approval_for_thread_for_test(&thread_id, "owner-card-2");
+    let desktop_ok = client
+        .post(format!("{origin}/v1/approvals/{approval_id_2}"))
+        .bearer_auth(&token)
+        .json(&json!({ "decision": "deny", "client": "desktop" }))
+        .send()
+        .await?;
+    assert_eq!(desktop_ok.status(), StatusCode::OK);
+    assert_eq!(
+        rx_2.await?,
+        codewhale_engine::runtime_threads::manager::ExternalApprovalDecision::Deny {
+            remember: false
+        }
+    );
 
     handle.abort();
     Ok(())

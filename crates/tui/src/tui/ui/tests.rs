@@ -8524,12 +8524,11 @@ fn session_approved_cache_does_not_promote_tool_name_grants_to_whole_tool() {
 }
 
 #[test]
-fn auto_review_force_prompt_fails_closed_without_a_modal() {
+fn auto_review_force_prompt_opens_modal_on_interactive_tui() {
     use codewhale_engine::core::authority::ApprovalRequestDisposition;
     let mut app = create_test_app();
     app.approval_mode = ApprovalMode::Auto;
 
-    // Auto-Review is autonomous: a forced hold is denied without pausing.
     assert_eq!(
         resolve_ui_approval_disposition(
             &app,
@@ -8538,7 +8537,7 @@ fn auto_review_force_prompt_fails_closed_without_a_modal() {
             "key",
             true,
         ),
-        ApprovalRequestDisposition::AutoDenyAutoReview
+        ApprovalRequestDisposition::Prompt
     );
 }
 
@@ -21075,6 +21074,186 @@ async fn redaction_gate_preserves_startup_and_external_input_without_dispatch() 
     assert_eq!(external.input, "callback while confirming");
     assert!(external.api_messages.is_empty());
     assert!(engine.rx_op.try_recv().is_err());
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn git_push_ask_rule_opens_approval_modal_in_auto_review() {
+    use crate::test_support::{EnvVarGuard, lock_test_env};
+    use codewhale_engine::core::engine::{EngineConfig, spawn_tui_engine};
+    use codewhale_engine::core::ops::{Op, TurnSpec, UserInputProvenance};
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _lock = lock_test_env();
+    let temp = tempfile::tempdir().unwrap();
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", temp.path());
+    let _proxy = EnvVarGuard::set("NO_PROXY", "*,127.0.0.1");
+
+    let server = MockServer::builder()
+        .body_print_limit(wiremock::BodyPrintLimit::Limited(0))
+        .start()
+        .await;
+    let tool_delta = serde_json::json!({
+        "id": "chatcmpl-tui-push",
+        "choices": [{
+            "index": 0,
+            "delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_tui_git_push",
+                "type": "function",
+                "function": {
+                    "name": "Bash",
+                    "arguments": "{\"action\":\"run\",\"command\":\"git push\"}"
+                }
+            }]},
+            "finish_reason": serde_json::Value::Null
+        }]
+    });
+    let tool_finish = serde_json::json!({
+        "id": "chatcmpl-tui-push",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+    });
+    let tool_call_sse = format!("data: {tool_delta}\n\ndata: {tool_finish}\n\ndata: [DONE]\n\n");
+    let done_sse = concat!(
+        "data: {\"id\":\"chatcmpl-tui-done\",\"choices\":[{\"index\":0,",
+        "\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-tui-done\",\"choices\":[{\"index\":0,\"delta\":{},",
+        "\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_string_contains("call_tui_git_push"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(done_sse),
+        )
+        .expect(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(tool_call_sse),
+        )
+        .expect(1)
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let config_path = temp.path().join("selected.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "provider = \"deepseek\"\napi_key = \"synthetic-tui-ask-key\"\nbase_url = \"{}\"\n",
+            server.uri()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        temp.path().join("permissions.toml"),
+        "[[rules]]\ntool = \"exec_shell\"\ncommand = \"git push\"\n",
+    )
+    .unwrap();
+    let config = codewhale_plugins::providers::load_config(Some(config_path), None).unwrap();
+
+    let mut app = crate::tui::test_support::test_app_with_options(TuiOptions {
+        start_in_agent_mode: true,
+        ..crate::tui::test_support::test_tui_options(temp.path())
+    });
+    app.auto_model = false;
+    app.onboarding = OnboardingState::None;
+    app.approval_mode = ApprovalMode::Auto;
+    app.is_loading = true;
+
+    let handle = spawn_tui_engine(
+        EngineConfig {
+            model: codewhale_config::descriptors::defaults::DEFAULT_TEXT_MODEL.to_string(),
+            workspace: temp.path().to_path_buf(),
+            snapshots_enabled: false,
+            subagents_enabled: false,
+            memory_enabled: false,
+            terminal_chrome_enabled: false,
+            exec_policy_engine: config.exec_policy_engine.clone(),
+            ..EngineConfig::default()
+        },
+        &config,
+        None,
+    )
+    .await;
+
+    handle
+        .send(Op::SendMessage(TurnSpec {
+            profile_constitution: None,
+            max_output_tokens: None,
+            content: "push changes".to_string(),
+            images: Vec::new(),
+            mode: AppMode::Agent,
+            route: Box::new(
+                resolve_runtime_route(&config, ProviderKind::Deepseek, Some(&app.model))
+                    .expect("structural route"),
+            ),
+            compaction: Box::default(),
+            initial_routed_usage: Box::default(),
+            goal_objective: None,
+            goal_token_budget: None,
+            goal_status: codewhale_engine::tools::goal::GoalStatus::Active,
+            reasoning_effort: None,
+            reasoning_effort_auto: false,
+            auto_model: false,
+            allow_shell: true,
+            trust_mode: false,
+            auto_approve: false,
+            approval_mode: ApprovalMode::Auto,
+            translation_enabled: false,
+            allowed_tools: None,
+            dynamic_tools: Vec::new(),
+            hook_executor: None,
+            verbosity: None,
+            provenance: UserInputProvenance::ExternalUser,
+            submission_id: None,
+        }))
+        .await
+        .expect("send turn");
+
+    let mut opened_modal = false;
+    let mut approval_id = None;
+    let mut rx = handle.rx_event.write().await;
+    while let Some(event) = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .expect("timed out waiting for TUI Auto-Review ask card")
+    {
+        match event {
+            EngineEvent::ApprovalRequired {
+                ref id,
+                approval_force_prompt,
+                ..
+            } => {
+                assert!(approval_force_prompt);
+                let id = id.clone();
+                approval_id = Some(id.clone());
+                drain_approval_event(&mut app, &handle, event).await;
+                opened_modal = app.view_stack.top_kind() == Some(ModalKind::Approval);
+                assert!(
+                    opened_modal,
+                    "interactive Auto-Review ask card must open ModalKind::Approval"
+                );
+                let _ = app.view_stack.pop();
+                handle.deny_tool_call(&id).await.expect("deny push modal");
+            }
+            EngineEvent::TurnComplete { .. } => break,
+            _ => {}
+        }
+    }
+    drop(rx);
+    assert!(opened_modal);
+    assert!(approval_id.is_some());
+    handle.send(Op::Shutdown).await.expect("shutdown");
 }
 
 #[tokio::test]
@@ -35795,7 +35974,7 @@ fn extension_prompt_origin_keeps_denials_and_other_policy_holds() {
     app.approval_mode = ApprovalMode::Auto;
     assert_eq!(
         resolve_ui_approval_disposition(&app, "bash", "group", key, true),
-        D::AutoDenyAutoReview
+        D::Prompt
     );
     app.approval_mode = ApprovalMode::Never;
     assert_eq!(

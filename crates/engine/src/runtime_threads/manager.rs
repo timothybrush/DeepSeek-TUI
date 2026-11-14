@@ -3613,6 +3613,13 @@ pub enum ApprovalResponder {
     Acp,
 }
 
+impl ApprovalResponder {
+    #[must_use]
+    pub const fn is_owner_surface(self) -> bool {
+        matches!(self, Self::Desktop | Self::Tui | Self::Web)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalApprovalBinding {
     pub thread_id: String,
@@ -3623,6 +3630,10 @@ pub struct ExternalApprovalBinding {
 #[derive(Debug, thiserror::Error)]
 #[error("approval does not belong to the claimed thread, turn or tool call")]
 pub struct ApprovalBindingMismatch;
+
+#[derive(Debug, thiserror::Error)]
+#[error("only the owner surface may answer this approval")]
+pub struct ApprovalOwnerRequired;
 
 #[derive(Debug, thiserror::Error)]
 #[error("thread is outside the selected workspace")]
@@ -3643,6 +3654,7 @@ pub(super) struct PendingApprovalEntry {
     pub(super) proposed: Option<ExternalApprovalDecision>,
     pub(super) responder: Option<ApprovalResponder>,
     pub(super) agent_settled: Option<watch::Receiver<Option<bool>>>,
+    pub(super) owner_only: bool,
 }
 
 pub(super) struct PendingUserInputEntry {
@@ -4904,11 +4916,12 @@ impl RuntimeThreadManager {
         format!("approval_{}", Uuid::new_v4().simple())
     }
 
-    pub(super) fn register_pending_approval(
+    pub(super) fn register_pending_approval_with_policy(
         &self,
         thread_id: &str,
         mut request: PendingApprovalRequest,
         publication: Option<crate::core::engine::NativeApprovalPublication>,
+        owner_only: bool,
     ) -> (String, oneshot::Receiver<ExternalApprovalDecision>) {
         // Provider call IDs can repeat across sessions and responses. Mint the
         // external capability here so delivery and cleanup can only settle this
@@ -4927,6 +4940,7 @@ impl RuntimeThreadManager {
                     proposed: None,
                     responder: None,
                     agent_settled: None,
+                    owner_only,
                 });
                 return (id, rx);
             }
@@ -5261,6 +5275,12 @@ impl RuntimeThreadManager {
                         .is_some_and(|id| entry.request.tool_call_id.as_deref() != Some(id)))
             {
                 return Err(ApprovalBindingMismatch.into());
+            }
+            if entry.owner_only
+                && !(self.owner_surface_attached
+                    && responder.is_some_and(ApprovalResponder::is_owner_surface))
+            {
+                return Err(ApprovalOwnerRequired.into());
             }
             if let Some(previous) = entry.proposed {
                 if previous != decision {
@@ -5611,7 +5631,7 @@ impl RuntimeThreadManager {
         thread_id: &str,
         label: &str,
     ) -> (String, oneshot::Receiver<ExternalApprovalDecision>) {
-        self.register_pending_approval(
+        self.register_pending_approval_with_policy(
             thread_id,
             PendingApprovalRequest {
                 // Overwritten by the mint; a caller-supplied ID is never honored.
@@ -5627,6 +5647,30 @@ impl RuntimeThreadManager {
                 summary: None,
             },
             None,
+            false,
+        )
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn register_owner_only_pending_approval_for_thread_for_test(
+        &self,
+        thread_id: &str,
+        label: &str,
+    ) -> (String, oneshot::Receiver<ExternalApprovalDecision>) {
+        self.register_pending_approval_with_policy(
+            thread_id,
+            PendingApprovalRequest {
+                id: String::new(),
+                turn_id: "test-turn".to_string(),
+                tool_name: "exec_shell".to_string(),
+                input: None,
+                description: format!("test approval {label}"),
+                intent_summary: None,
+                tool_call_id: Some(label.to_string()),
+                summary: None,
+            },
+            None,
+            true,
         )
     }
 
@@ -18284,13 +18328,18 @@ source_usage_records: Default::default(),
                         ));
                     }
                     let is_automatic = automatic.is_some();
+                    let owner_only = approval_authority.approval_mode_for_session()
+                        == ApprovalMode::Auto
+                        && approval_force_prompt
+                        && disposition == ApprovalRequestDisposition::Prompt;
                     let (approval_id, mut answer) = if is_automatic {
                         (Self::mint_approval_id(), None)
                     } else {
-                        let (approval_id, receiver) = self.register_pending_approval(
+                        let (approval_id, receiver) = self.register_pending_approval_with_policy(
                             &thread_id,
                             pending_request,
                             Some(publication.clone()),
+                            owner_only,
                         );
                         (approval_id, Some(receiver))
                     };

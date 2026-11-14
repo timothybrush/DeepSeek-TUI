@@ -182,6 +182,190 @@ async fn shutdown_waits_actual_engine_exit_and_terminal_monitor_before_releasing
 }
 
 #[tokio::test]
+async fn background_task_with_ask_rule_refuses_without_pending_approval_and_interactive_card_requires_owner()
+-> Result<()> {
+    use crate::llm_client::mock::{MockLlmClient, canned};
+
+    let root = tempfile::tempdir()?;
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir_all(&workspace)?;
+    let mut cfg = Config::default().with_legacy_root(
+        Some("task-ownership-ask-rule-key".to_string()),
+        Some("http://127.0.0.1:1/v1".to_string()),
+    );
+    cfg.allow_shell = Some(true);
+    cfg.exec_policy_engine = codewhale_execpolicy::ExecPolicyEngine::with_rulesets(vec![
+        codewhale_execpolicy::Ruleset::user(vec![], vec![]).with_ask_rules(vec![
+            codewhale_execpolicy::ToolAskRule::exec_shell("git push"),
+        ]),
+    ]);
+    let plugins = Arc::new(codewhale_plugins::PluginRegistry::empty(&workspace));
+    let owner_arc = Arc::new(RuntimeThreadManager::open_owner_host(
+        cfg,
+        workspace.clone(),
+        test_manager_config(root.path().join("rt-owner")),
+        plugins,
+        None,
+        None,
+    )?);
+
+    let mock = Arc::new(MockLlmClient::new(vec![
+        canned::tool_call_turn(
+            "call_task_ask",
+            "Bash",
+            r#"{"action":"run","command":"git push"}"#,
+        ),
+        canned::simple_text_turn("task done"),
+        canned::tool_call_turn(
+            "call_interactive_ask",
+            "Bash",
+            r#"{"action":"run","command":"git push"}"#,
+        ),
+        canned::simple_text_turn("interactive done"),
+    ]));
+    owner_arc.set_test_model_client(mock.clone());
+
+    let task_thread = owner_arc
+        .create_thread(CreateThreadRequest {
+            workspace: Some(workspace.clone()),
+            permission_posture: Some("auto-review".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let task_turn = owner_arc
+        .start_task_turn(
+            &task_thread.id,
+            StartTurnRequest {
+                prompt: "scheduled task push".to_string(),
+                allow_shell: Some(true),
+                ..Default::default()
+            },
+            "task-ask-rule-1",
+        )
+        .await?;
+    let settled_task = wait_for_terminal_turn(owner_arc.as_ref(), &task_turn.id).await?;
+    assert_eq!(
+        settled_task.status,
+        RuntimeTurnStatus::Completed,
+        "task failed: {:?}",
+        settled_task.error
+    );
+    assert_eq!(
+        owner_arc.pending_approvals_count(),
+        0,
+        "Background task turn must register no pending approval"
+    );
+    let task_events = owner_arc.events_since(&task_thread.id, None)?;
+    assert!(
+        !task_events.iter().any(|ev| ev.event == "approval.required"),
+        "Background task turn must not emit approval.required: {task_events:?}"
+    );
+    assert!(
+        task_events
+            .iter()
+            .any(|ev| { ev.event == "item.failed" && ev.payload.to_string().contains("git push") }),
+        "Background task refusal must name the ask rule: {task_events:?}"
+    );
+
+    let interactive_thread = owner_arc
+        .create_thread(CreateThreadRequest {
+            workspace: Some(workspace),
+            permission_posture: Some("auto-review".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let interactive_turn = owner_arc
+        .start_turn(
+            &interactive_thread.id,
+            StartTurnRequest {
+                prompt: "interactive owner push".to_string(),
+                allow_shell: Some(true),
+                ..Default::default()
+            },
+        )
+        .await?;
+    let interactive_deadline = Instant::now() + APPROVAL_READINESS_TIMEOUT;
+    let execution_id = loop {
+        if let Some(id) = owner_arc
+            .events_since(&interactive_thread.id, None)?
+            .into_iter()
+            .find_map(|event| {
+                (event.event == "item.started"
+                    && event
+                        .payload
+                        .pointer("/item/metadata/provider_tool_use_id")
+                        .and_then(Value::as_str)
+                        == Some("call_interactive_ask"))
+                .then(|| {
+                    event
+                        .payload
+                        .pointer("/item/metadata/execution_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .flatten()
+            })
+        {
+            break id;
+        }
+        anyhow::ensure!(
+            Instant::now() < interactive_deadline,
+            "interactive item.started not emitted for call_interactive_ask"
+        );
+        sleep(Duration::from_millis(20)).await;
+    };
+    let approval_id =
+        await_approval_identity(owner_arc.as_ref(), &interactive_thread.id, &execution_id).await?;
+    assert_eq!(owner_arc.pending_approvals_count(), 1);
+
+    for non_owner in [
+        None,
+        Some(ApprovalResponder::Phone),
+        Some(ApprovalResponder::Acp),
+    ] {
+        let err = owner_arc
+            .deliver_approval_from(
+                &approval_id,
+                None,
+                ExternalApprovalDecision::Allow { remember: false },
+                non_owner,
+            )
+            .await
+            .expect_err("non-owner responder must be refused on owner-only Auto-Review card");
+        assert!(
+            err.is::<ApprovalOwnerRequired>(),
+            "expected ApprovalOwnerRequired for {non_owner:?}, got {err:#}"
+        );
+        assert_eq!(
+            owner_arc.pending_approvals_count(),
+            1,
+            "rejected non-owner response must keep the card pending"
+        );
+    }
+
+    let delivered = owner_arc
+        .deliver_approval_from(
+            &approval_id,
+            None,
+            ExternalApprovalDecision::Allow { remember: false },
+            Some(ApprovalResponder::Desktop),
+        )
+        .await?;
+    assert!(delivered);
+    let settled_interactive =
+        wait_for_terminal_turn(owner_arc.as_ref(), &interactive_turn.id).await?;
+    assert_eq!(
+        settled_interactive.status,
+        RuntimeTurnStatus::Completed,
+        "interactive turn failed: {:?}",
+        settled_interactive.error
+    );
+    assert_eq!(owner_arc.pending_approvals_count(), 0);
+    owner_arc.shutdown_and_wait().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn shutdown_drains_accepted_user_input_receipt_after_caller_disconnects() -> Result<()> {
     let root = tempfile::tempdir()?;
     let runtime = Arc::new(test_manager(root.path().join("runtime"))?);
