@@ -28825,25 +28825,22 @@ mod readonly_shell_6015 {
 }
 
 /// #6015: a child that waits for a launch slot gets its full work budget
-/// from the moment it launches. Under the old shared deadline, the queue wait
-/// below would leave too little time for the one slow model response.
+/// from the moment it launches.
 #[tokio::test]
 async fn late_launch_permit_still_gets_the_full_work_budget() {
     use tokio_util::sync::CancellationToken;
 
-    const WALL_TIME: Duration = Duration::from_millis(4_000);
-    const QUEUE_HOLD: Duration = Duration::from_millis(3_500);
-    const MODEL_DELAY: Duration = Duration::from_millis(900);
+    const WALL_TIME: Duration = Duration::from_secs(120);
+    const ELAPSED_BEFORE_QUEUE: Duration = Duration::from_secs(60);
 
-    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let observed_requests = Arc::clone(&requests);
+    let first_request_ms = Arc::new(std::sync::OnceLock::new());
+    let observed_request_ms = Arc::clone(&first_request_ms);
     let app = Router::new().route(
         "/{*path}",
         post(move |Json(body): Json<Value>| {
-            let requests = Arc::clone(&observed_requests);
+            let observed_request_ms = Arc::clone(&observed_request_ms);
             async move {
-                requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                tokio::time::sleep(MODEL_DELAY).await;
+                observed_request_ms.get_or_init(epoch_millis_now);
                 chat_fixture_response(
                     body.get("stream").and_then(Value::as_bool).unwrap_or(false),
                     json!({
@@ -28889,7 +28886,7 @@ async fn late_launch_permit_still_gets_the_full_work_budget() {
         Some("test-key".to_string()),
         Some(format!("http://{addr}/v1")),
     );
-    let client = CodewhaleClient::new(&fixture_config).expect("delayed chat client");
+    let client = CodewhaleClient::new(&fixture_config).expect("fixture chat client");
 
     let tmp = tempdir().expect("tempdir");
     let manager = Arc::new(RwLock::new(SubAgentManager::new(
@@ -28911,7 +28908,9 @@ async fn late_launch_permit_still_gets_the_full_work_budget() {
         "boot_test".to_string(),
     );
     agent.status = SubAgentStatus::Running;
+    let (event_tx, mut event_rx) = mpsc::channel(64);
     let mut runtime = stub_runtime();
+    runtime.event_tx = Some(event_tx);
     runtime.client = client;
     runtime.api_config = Some(Arc::new(fixture_config));
     runtime.manager = Arc::clone(&manager);
@@ -28925,7 +28924,7 @@ async fn late_launch_permit_still_gets_the_full_work_budget() {
 
     let gate = Arc::new(governor::DynamicGate::new(1));
     let held = Arc::clone(&gate).try_acquire().expect("hold the only slot");
-    let spawned_at_ms = epoch_millis_now();
+    let started_at = Instant::now() - ELAPSED_BEFORE_QUEUE;
     let task_handle = tokio::spawn(run_subagent_task(SubAgentTask {
         manager_handle: Arc::clone(&manager),
         runtime,
@@ -28935,7 +28934,7 @@ async fn late_launch_permit_still_gets_the_full_work_budget() {
         assignment: make_assignment(),
         allowed_tools: Some(vec![]),
         fork_context: false,
-        started_at: Instant::now(),
+        started_at,
         max_steps: 1,
         wall_time: Some(WALL_TIME),
         wall_ceiling_ms: None,
@@ -28943,9 +28942,21 @@ async fn late_launch_permit_still_gets_the_full_work_budget() {
         launch_gate: Some(Arc::clone(&gate)),
         _foreground_child_registration: None,
     }));
-    tokio::time::sleep(QUEUE_HOLD).await;
+    tokio::time::timeout_at((started_at + WALL_TIME).into(), async {
+        while let Some(event) = event_rx.recv().await {
+            if matches!(event, Event::AgentProgress { id, activity, .. }
+                if id == agent_id && activity.worker_status == AgentWorkerStatus::Queued)
+            {
+                return;
+            }
+        }
+        panic!("worker event channel closed before the launch queued");
+    })
+    .await
+    .expect("child queues before its original deadline");
+    let permit_released_ms = epoch_millis_now();
     drop(held);
-    tokio::time::timeout(Duration::from_secs(10), task_handle)
+    tokio::time::timeout(WALL_TIME, task_handle)
         .await
         .expect("child finishes")
         .expect("child task exits cleanly");
@@ -28957,10 +28968,9 @@ async fn late_launch_permit_still_gets_the_full_work_budget() {
         .expect("child remains inspectable");
     assert!(
         matches!(snapshot.status, SubAgentStatus::Completed),
-        "a late launch must still get its full budget: {:?}; retained result {:?}; model requests {}",
+        "a late launch must still get its full budget: {:?}; retained result {:?}",
         snapshot.status,
-        snapshot.result,
-        requests.load(std::sync::atomic::Ordering::Relaxed)
+        snapshot.result
     );
     assert_eq!(snapshot.result.as_deref(), Some("done after launch"));
 
@@ -28975,10 +28985,10 @@ async fn late_launch_permit_still_gets_the_full_work_budget() {
         .and_then(|record| record.spec.runtime_profile.wall_deadline_ms)
         .expect("launch saves the restarted deadline");
     let wall_ms = u64::try_from(WALL_TIME.as_millis()).expect("wall ms");
-    let hold_ms = u64::try_from(QUEUE_HOLD.as_millis()).expect("hold ms");
+    let request_ms = *first_request_ms.get().expect("worker reached the model");
     assert!(
-        saved_deadline_ms >= spawned_at_ms + hold_ms + wall_ms,
-        "saved deadline {saved_deadline_ms} must start from launch, not spawn ({spawned_at_ms})"
+        (permit_released_ms + wall_ms..=request_ms + wall_ms).contains(&saved_deadline_ms),
+        "saved deadline {saved_deadline_ms} must grant the full work budget at launch"
     );
 }
 
