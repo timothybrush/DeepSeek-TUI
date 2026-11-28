@@ -9230,9 +9230,8 @@ impl RuntimeThreadManager {
     /// state, so dropping the flush would leave a page reporting attention for
     /// turns that are already over until somebody opened the thread. Now that
     /// rows no longer go through detail, doing it here keeps what the route
-    /// publishes. A thread with nothing queued costs one lock and a map lookup
-    /// — only startup recovery queues receipts — and the flush has to precede
-    /// the scan, because it changes what the scan then reports.
+    /// publishes. A thread with nothing queued costs one lock and a map lookup.
+    /// The flush precedes the scan because it changes what the scan reports.
     pub async fn flush_recovery_receipts(&self, thread_ids: &[String]) -> Result<()> {
         for thread_id in thread_ids {
             self.flush_recovery_receipts_for_thread(thread_id).await?;

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- External agent sessions record a turn’s completion before accepting more work. The Runtime retries an interrupted journal write when the session is read again.
+
 - On Windows, verifier commands start inside a Job Object so Stop can also end the helper processes they launch.
 - Native stdio submissions recover a lost acknowledgement through the Runtime’s saved operation receipt. Disconnecting during admission cleans up the matching turn without resubmitting the prompt.
 

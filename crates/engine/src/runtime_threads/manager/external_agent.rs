@@ -674,7 +674,7 @@ fn chunk_text(update: &Value) -> Option<String> {
 }
 
 #[derive(Default)]
-struct ExternalProjection {
+pub(in crate::runtime_threads) struct ExternalProjection {
     message: Option<TurnItemRecord>,
     reasoning: Option<TurnItemRecord>,
     tools: HashMap<String, TurnItemRecord>,
@@ -1245,6 +1245,10 @@ impl RuntimeThreadManager {
             }
             bail!("Thread already has an active turn");
         }
+        anyhow::ensure!(
+            !self.recovery_receipts.lock().contains_key(&thread.id),
+            "The previous turn's terminal receipt is pending; retry after it is recorded"
+        );
         let cancel = self.cancel_token.child_token();
         state.active_turn = Some(ExternalActiveTurn {
             turn_id: turn_id.clone(),
@@ -1954,7 +1958,7 @@ impl RuntimeThreadManager {
         }
     }
 
-    async fn settle_external_turn(
+    pub(in crate::runtime_threads) async fn settle_external_turn(
         &self,
         thread: &ThreadRecord,
         turn_id: &str,
@@ -2055,26 +2059,38 @@ impl RuntimeThreadManager {
         })
         .await
         .context("external turn settlement worker failed")??;
-        let session_lost = outcome.is_err();
+        let completion = self.emit_turn_completed_if_missing(&turn, false).await;
+        if completion.is_err() {
+            self.queue_recovery_receipt(RecoveredTurnReceipt {
+                turn,
+                unresolved_dynamic_tools: Vec::new(),
+            });
+        }
         let removed = {
             let mut active = self.active.lock().await;
-            if let Some(state) = active.external.get_mut(&thread.id)
-                && state
-                    .active_turn
-                    .as_ref()
-                    .is_some_and(|active| active.turn_id == turn_id)
-            {
-                state.active_turn = None;
-            }
-            if session_lost {
-                active.external.remove(&thread.id)
-            } else {
-                None
+            match active.external.get_mut(&thread.id) {
+                Some(state)
+                    if state
+                        .active_turn
+                        .as_ref()
+                        .is_some_and(|live| live.turn_id == turn_id) =>
+                {
+                    if outcome.is_err() {
+                        active.external.remove(&thread.id)
+                    } else {
+                        state.active_turn = None;
+                        None
+                    }
+                }
+                _ => None,
             }
         };
-        self.emit_turn_completed_if_missing(&turn, false).await?;
+        let stopped = removed.is_some();
         if let Some(state) = removed {
             let _ = tokio::task::spawn_blocking(move || state.session.stop_blocking()).await;
+        }
+        completion?;
+        if stopped {
             let reason = match &outcome {
                 Err(reason) => label(Some(&Value::String(reason.clone())), "the agent exited"),
                 Ok(_) => "the agent exited".to_string(),

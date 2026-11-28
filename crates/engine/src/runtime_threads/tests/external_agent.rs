@@ -69,6 +69,45 @@ async fn events(
     manager.events_since_async(thread_id, None).await
 }
 
+#[tokio::test]
+async fn external_terminal_journal_error_recovers_once_in_the_same_runtime() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let manager = test_manager(root.path().join("runtime"))?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let turn = sample_turn(
+        &thread.id,
+        "turn_external_settlement",
+        RuntimeTurnStatus::InProgress,
+    );
+    manager.store.save_turn(&turn)?;
+    let fault = EventAppendFaultGuard::arm(&thread.id, EventAppendTestFault::AfterFlush);
+    assert!(
+        manager
+            .settle_external_turn(&thread, &turn.id, Default::default(), Ok("end_turn".into()))
+            .await
+            .is_err()
+    );
+    drop(fault);
+    assert_eq!(
+        manager.store.load_turn(&turn.id)?.status,
+        RuntimeTurnStatus::Completed
+    );
+    for _ in 0..2 {
+        let history = events(&manager, &thread.id).await?;
+        let receipts = history
+            .iter()
+            .filter(|e| {
+                e.event == "turn.completed" && e.turn_id.as_deref() == Some(turn.id.as_str())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].payload["recovered"], true);
+    }
+    Ok(())
+}
+
 #[test]
 fn executor_record_round_trips_and_legacy_threads_stay_native() -> Result<()> {
     let legacy = serde_json::to_value(sample_thread("thr_legacy"))?;
